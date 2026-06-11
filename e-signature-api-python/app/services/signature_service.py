@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import logging
@@ -22,6 +23,7 @@ from app.core.config import settings
 from app.schemas.signature import SignDocumentRequest
 from app.services.accumulator_service import accumulate_signature, verify_membership
 from app.services.pdf_seal_service import create_signed_pdf_seal
+from app.utils.hashing import compute_file_sha256
 from app.utils.timing import log_duration
 
 
@@ -161,6 +163,32 @@ async def sign_document(
 
     if document.status_id == SIGNED_DOCUMENT_STATUS:
         raise ValueError("Documento já foi assinado e não pode ser assinado novamente.")
+
+    with log_duration(
+        logger,
+        "Reverificação do Hash do Arquivo (pré-assinatura)",
+        document_id=document_id,
+    ):
+        actual_file_hash = await asyncio.to_thread(
+            compute_file_sha256, document.file_path
+        )
+    if actual_file_hash is None:
+        raise ValueError(
+            "Arquivo original do documento não encontrado para verificação "
+            "de integridade. Assinatura abortada."
+        )
+    if actual_file_hash != document.hash_sha256:
+        logger.error(
+            "Integridade violada antes da assinatura: hash do arquivo em disco "
+            "difere do registrado. document_id=%s registrado=%s atual=%s",
+            document_id,
+            document.hash_sha256,
+            actual_file_hash,
+        )
+        raise ValueError(
+            "Integridade violada: o arquivo do documento em disco não "
+            "corresponde ao hash registrado no upload. Assinatura abortada."
+        )
 
     public_key_pem = payload.public_key_pem or signer.public_key
     if not public_key_pem:
@@ -367,6 +395,18 @@ async def get_document_signature_summary(db: AsyncSession, document_id: int):
         "validation_code": signature.validation_code,
         "validation_url": signature.validation_url,
     }
+
+
+async def get_document_by_validation_code(
+    db: AsyncSession,
+    validation_code: str,
+) -> Document | None:
+    result = await db.execute(
+        select(Document)
+        .join(DigitalSignature, DigitalSignature.doc_sign_id == Document.document_id)
+        .where(DigitalSignature.validation_code == validation_code)
+    )
+    return result.scalars().first()
 
 
 async def get_latest_signature_for_document(

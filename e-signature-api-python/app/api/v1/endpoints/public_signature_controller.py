@@ -1,12 +1,19 @@
+import asyncio
+import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from urllib.parse import quote
 
 from cryptography.hazmat.primitives import serialization
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.db import get_db
 from app.services import signature_service
+from app.utils.hashing import compute_file_sha256
 from app.api.v1.responses import err, _500
 
 logger = logging.getLogger(__name__)
@@ -128,6 +135,23 @@ async def validate_signature_publicly(
     )
     safe_public_key = _safe_public_key_pem(result["public_key_pem"])
 
+    actual_file_hash = await asyncio.to_thread(compute_file_sha256, document.file_path)
+    arquivo_integro = (
+        None if actual_file_hash is None
+        else actual_file_hash == document.hash_sha256
+    )
+    if arquivo_integro is False:
+        logger.error(
+            "Arquivo original em disco não corresponde ao hash registrado. "
+            "validation_code=%s document_id=%s",
+            validation_code,
+            document.document_id,
+        )
+    original_url = (
+        f"{settings.PUBLIC_BASE_URL}/public/signatures/"
+        f"{signature.validation_code}/original"
+    )
+
     return {
         "valido": is_valid,
         "status": (
@@ -158,10 +182,16 @@ async def validate_signature_publicly(
         "documento": {
             "hash_sha256": document.hash_sha256,
             "algoritmo_de_hash": "SHA-256",
+            "arquivo_integro_no_servidor": arquivo_integro,
+            "arquivo_original_url": original_url,
             "observacao": (
-                "Hash do arquivo PDF original. Para confirmar que o documento "
-                "não foi alterado, calcule o SHA-256 do arquivo e compare com "
-                "o hash acima."
+                "Hash do arquivo PDF ORIGINAL, anterior à aplicação do selo "
+                "visual (o PDF selado tem bytes diferentes por construção). "
+                "Para conferir de forma independente, baixe o original em "
+                "'arquivo_original_url', calcule o SHA-256 e compare com o "
+                "hash acima. 'arquivo_integro_no_servidor' é a reconferência "
+                "feita pelo servidor neste instante (true = arquivo em disco "
+                "ainda produz o hash registrado)."
             ),
         },
 
@@ -211,3 +241,74 @@ async def validate_signature_publicly(
             },
         },
     }
+
+
+@router.get("/{validation_code}/original", responses=(
+    err(404, "Não encontrado", "Assinatura ou arquivo original não encontrado.") |
+    err(409, "Integridade violada",
+        "O arquivo original armazenado não corresponde ao hash registrado.") |
+    _500
+))
+async def download_original_document(
+    validation_code: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Serve o PDF ORIGINAL (pré-selo) para verificação independente.
+
+    O hash registrado e assinado refere-se a este arquivo — o PDF selado tem
+    bytes diferentes por construção. Antes de servir, o servidor reconfere o
+    SHA-256 do arquivo em disco contra o hash registrado e se recusa a
+    entregar um arquivo adulterado como se fosse o original (409).
+    """
+    document = await signature_service.get_document_by_validation_code(
+        db, validation_code
+    )
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Assinatura não encontrada.",
+        )
+
+    def _read_file(path: str | None) -> bytes | None:
+        if not path:
+            return None
+        file_path = Path(path)
+        if not file_path.exists() or not file_path.is_file():
+            return None
+        return file_path.read_bytes()
+
+    file_bytes = await asyncio.to_thread(_read_file, document.file_path)
+    if file_bytes is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Arquivo original do documento não encontrado.",
+        )
+
+    actual_hash = hashlib.sha256(file_bytes).hexdigest()
+    if actual_hash != document.hash_sha256:
+        logger.error(
+            "Recusado download do original: hash do arquivo difere do "
+            "registrado. validation_code=%s document_id=%s",
+            validation_code,
+            document.document_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "O arquivo original armazenado não corresponde ao hash "
+                "registrado no momento do upload (possível adulteração do "
+                "armazenamento). O hash registrado permanece a referência "
+                "probatória — consulte o portal de validação."
+            ),
+        )
+
+    filename = document.file_name or "documento-original.pdf"
+    return Response(
+        content=file_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename*=utf-8''{quote(filename)}",
+            "X-Document-SHA256": actual_hash,
+        },
+    )
