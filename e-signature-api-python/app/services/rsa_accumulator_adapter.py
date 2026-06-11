@@ -167,6 +167,17 @@ class RsaAccumulatorAdapter:
         return _root_factor(generator, elements, modulus_n)
 
 
+def _miller_rabin_round(value: int, d: int, s: int, base: int) -> bool:
+    x = pow(base, d, value)
+    if x == 1 or x == value - 1:
+        return True
+    for _ in range(s - 1):
+        x = pow(x, 2, value)
+        if x == value - 1:
+            return True
+    return False
+
+
 def _is_probable_prime(value: int) -> bool:
     if value < 2:
         return False
@@ -186,14 +197,12 @@ def _is_probable_prime(value: int) -> bool:
     for base in small_primes:
         if base >= value:
             continue
-        x = pow(base, d, value)
-        if x == 1 or x == value - 1:
-            continue
-        for _ in range(s - 1):
-            x = pow(x, 2, value)
-            if x == value - 1:
-                break
-        else:
+        if not _miller_rabin_round(value, d, s, base):
+            return False
+
+    for _ in range(8):
+        base = secrets.randbelow(value - 3) + 2
+        if not _miller_rabin_round(value, d, s, base):
             return False
 
     return True

@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timezone
 
@@ -21,7 +22,10 @@ from app.core.config import settings
 from app.schemas.signature import SignDocumentRequest
 from app.services.accumulator_service import accumulate_signature, verify_membership
 from app.services.pdf_seal_service import create_signed_pdf_seal
+from app.utils.timing import log_duration
 
+
+logger = logging.getLogger(__name__)
 
 SIGNED_DOCUMENT_STATUS = 3
 SIGNED_SIGNER_STATUS = SignerStatus.SIGNED.value  # = 4
@@ -35,15 +39,16 @@ def _verify_rsa_signature(public_key_pem: str, document_hash: str, signature_bas
         raise ValueError("Chave pública ou assinatura em Base64 inválida") from exc
 
     try:
-        public_key.verify(
-            signature,
-            document_hash.encode("ascii"),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=32,
-            ),
-            hashes.SHA256(),
-        )
+        with log_duration(logger, "Verificação da Assinatura (API)"):
+            public_key.verify(
+                signature,
+                document_hash.encode("ascii"),
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=32,
+                ),
+                hashes.SHA256(),
+            )
     except InvalidSignature as exc:
         raise ValueError("Assinatura digital inválida para o hash do documento") from exc
 
@@ -192,13 +197,19 @@ async def sign_document(
         signed_at=digital_signature.signed_at,
     )
 
-    accumulator = await accumulate_signature(
-        db=db,
+    with log_duration(
+        logger,
+        "Acumulação do Evento de Assinatura",
         document_id=document.document_id,
         signature_id=digital_signature.signature_id,
-        hash_hex=event_hash,
-        created_by=user.user_id,
-    )
+    ):
+        accumulator = await accumulate_signature(
+            db=db,
+            document_id=document.document_id,
+            signature_id=digital_signature.signature_id,
+            hash_hex=event_hash,
+            created_by=user.user_id,
+        )
 
     document.status_id = SIGNED_DOCUMENT_STATUS
     document.updated_at = datetime.utcnow()
@@ -207,14 +218,21 @@ async def sign_document(
 
     await db.flush()
     try:
-        digital_signature.signed_file_path = create_signed_pdf_seal(
-            document=document,
-            signer=signer,
-            signature=digital_signature,
-            state=accumulator.state,
-            element=accumulator.element,
-            witness=accumulator.witness,
-        )
+        with log_duration(
+            logger,
+            "Geração do PDF Selado",
+            document_id=document.document_id,
+            signature_id=digital_signature.signature_id,
+        ):
+            digital_signature.signed_file_path = create_signed_pdf_seal(
+                document=document,
+                signer=signer,
+                signature=digital_signature,
+                state=accumulator.state,
+                element=accumulator.element,
+                witness=accumulator.witness,
+                previous_state=accumulator.previous_state,
+            )
     except RuntimeError as exc:
         raise ValueError(str(exc)) from exc
 

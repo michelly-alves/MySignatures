@@ -6,6 +6,7 @@ from app.models.accumulator import AccumulatorElement, AccumulatorState, Witness
 from app.models.digital_signature import DigitalSignature
 from app.models.document import Document
 from app.models.signer import Signer
+from app.services.accumulator_service import state_fingerprint
 
 _BRT = ZoneInfo("America/Sao_Paulo")
 
@@ -23,6 +24,7 @@ def create_signed_pdf_seal(
     state: AccumulatorState,
     element: AccumulatorElement,
     witness: Witness,
+    previous_state: AccumulatorState | None = None,
 ) -> str:
     try:
         from pypdf import PdfReader, PdfWriter
@@ -52,7 +54,7 @@ def create_signed_pdf_seal(
 
         c = canvas.Canvas(str(overlay_path), pagesize=(page_width, page_height))
 
-        seal_height = 50 * mm
+        seal_height = 64 * mm
         margin_x = 15 * mm
         content_width = page_width - 2 * margin_x
 
@@ -64,7 +66,7 @@ def create_signed_pdf_seal(
 
         c.setFillColor(colors.HexColor("#1B5E20"))
         c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin_x, 42 * mm, "DOCUMENTO ASSINADO ELETRONICAMENTE")
+        c.drawString(margin_x, 56 * mm, "DOCUMENTO ASSINADO ELETRONICAMENTE")
 
         signed_at_utc = signature.signed_at or datetime.now(tz=timezone.utc)
         signed_at_text = _to_brt(signed_at_utc).strftime("%d/%m/%Y %H:%M:%S") + " (BRT)"
@@ -78,15 +80,36 @@ def create_signed_pdf_seal(
 
         c.setFillColor(colors.HexColor("#263238"))
         c.setFont("Helvetica", 9)
-        c.drawString(margin_x, 34 * mm, f"Assinado por: {signer.full_name}")
-        c.drawString(margin_x, 29 * mm, f"Data/hora: {signed_at_text}")
-        c.drawString(margin_x, 24 * mm, f"Código de validação: {signature.validation_code}")
-        c.drawString(margin_x, 19 * mm, f"Prova de pertencimento ao acumulador RSA: {valid_label}")
+        c.drawString(margin_x, 48 * mm, f"Assinado por: {signer.full_name}")
+        c.drawString(margin_x, 43 * mm, f"Data/hora: {signed_at_text}")
+        c.drawString(margin_x, 38 * mm, f"Código de validação: {signature.validation_code}")
+        c.drawString(margin_x, 33 * mm, f"Prova de pertencimento ao acumulador RSA: {valid_label}")
 
         c.setFont("Helvetica", 8)
-        c.drawString(margin_x, 13 * mm, "Hash SHA-256 do documento original:")
+        c.drawString(margin_x, 27 * mm, "Hash SHA-256 do documento original:")
         c.setFont("Courier", 7)
-        c.drawString(margin_x, 9 * mm, document.hash_sha256)
+        c.drawString(margin_x, 23 * mm, document.hash_sha256)
+
+        if previous_state is not None:
+            previous_label = (
+                f"anterior #{previous_state.state_id}: "
+                f"{state_fingerprint(previous_state.state_value_hex)}"
+            )
+        else:
+            previous_label = "anterior: estado inicial do acumulador"
+
+        c.setFont("Helvetica", 8)
+        c.setFillColor(colors.HexColor("#263238"))
+        c.drawString(
+            margin_x, 17 * mm,
+            "Vínculo de cadeia do acumulador (SHA-256 dos estados — confira no registro público):",
+        )
+        c.setFont("Courier", 7)
+        c.drawString(
+            margin_x, 13 * mm,
+            f"estado   #{state.state_id}: {state_fingerprint(state.state_value_hex)}",
+        )
+        c.drawString(margin_x, 9 * mm, previous_label)
 
         c.setFont("Helvetica-Oblique", 7)
         c.setFillColor(colors.HexColor("#2E7D32"))

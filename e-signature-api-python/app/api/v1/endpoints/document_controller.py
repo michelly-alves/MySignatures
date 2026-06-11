@@ -7,8 +7,10 @@ from fastapi import (
     HTTPException,
     status
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
+from urllib.parse import quote
 import asyncio
+import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from pathlib import Path
 import hashlib
@@ -17,6 +19,7 @@ import uuid
 
 from sqlalchemy import select
 from app.db import get_db
+from app.utils.timing import log_duration
 from app.schemas.document import CreateDocument, UpdateDocument
 from app.services import document_service
 from app.services.signature_service import get_latest_signature_for_document
@@ -28,7 +31,8 @@ from app.dependencies.auth import get_current_user
 from app.api.v1.responses import err, _401, _422, _500
 
 router = APIRouter(prefix="/documents", tags=["Documents"])
-TIMEOUT_SECONDS = 30 
+logger = logging.getLogger(__name__)
+TIMEOUT_SECONDS = 30
 MAX_DOCUMENT_FILE_SIZE = 10 * 1024 * 1024
 MAX_PHOTO_FILE_SIZE = 5 * 1024 * 1024
 ALLOWED_PHOTO_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -212,11 +216,12 @@ async def create_document(
 
     doc_filename = f"{uuid.uuid4()}-{document_file.filename}"
     doc_path = upload_dir / doc_filename
-    doc_bytes = await _read_upload_with_limit(
-        document_file,
-        MAX_DOCUMENT_FILE_SIZE,
-        "document_file"
-    )
+    with log_duration(logger, "Upload de PDF (recepção)", file_name=document_file.filename):
+        doc_bytes = await _read_upload_with_limit(
+            document_file,
+            MAX_DOCUMENT_FILE_SIZE,
+            "document_file"
+        )
 
     photo_filename = f"{uuid.uuid4()}-{signer_photo_id_file.filename}"
     photo_path = upload_dir / photo_filename
@@ -226,7 +231,8 @@ async def create_document(
         "signer_photo_id_file"
     )
 
-    hash_sha256 = hashlib.sha256(doc_bytes).hexdigest()
+    with log_duration(logger, "Cálculo do Hash do Documento", file_name=document_file.filename, size_bytes=len(doc_bytes)):
+        hash_sha256 = hashlib.sha256(doc_bytes).hexdigest()
     signer_national_id = re.sub(r"\D", "", signer_national_id)
     status_id = DOCUMENT_STATUS_IN_PROGRESS
 
@@ -244,7 +250,8 @@ async def create_document(
     )
 
     try:
-        doc_path.write_bytes(doc_bytes)
+        with log_duration(logger, "Upload de PDF (gravação em disco)", path=str(doc_path)):
+            doc_path.write_bytes(doc_bytes)
         photo_path.write_bytes(photo_bytes)
 
         document = await asyncio.wait_for(
@@ -315,10 +322,20 @@ async def get_document_file(
             detail="Arquivo do documento não encontrado"
         )
 
-    return FileResponse(
-        path=document_path,
+    with log_duration(
+        logger,
+        "Download de PDF (leitura do arquivo em disco)",
+        document_id=document_id,
+        path=str(document_path),
+        size_bytes=document_path.stat().st_size,
+    ):
+        file_bytes = document_path.read_bytes()
+
+    disposition = f"attachment; filename*=utf-8''{quote(document.file_name)}"
+    return Response(
+        content=file_bytes,
         media_type="application/pdf",
-        filename=document.file_name,
+        headers={"Content-Disposition": disposition},
     )
 
 

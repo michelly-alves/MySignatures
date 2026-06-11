@@ -39,8 +39,8 @@ class Witness(Base):
     __tablename__ = "witness"
 
     witness_id = Column(Integer, primary_key=True)
-    element_id = Column(Integer, ForeignKey("accumulator_element.element_id"), nullable=False)
-    state_id = Column(Integer, ForeignKey("accumulator_state.state_id"), nullable=False)
+    element_id = Column(Integer, ForeignKey("accumulator_element.element_id"), nullable=False, index=True)
+    state_id = Column(Integer, ForeignKey("accumulator_state.state_id"), nullable=False, index=True)
     witness_value_hex = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     created_by = Column(Integer, nullable=True)

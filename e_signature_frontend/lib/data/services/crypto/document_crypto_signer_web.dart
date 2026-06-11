@@ -3,6 +3,10 @@ import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
 
+void _logDuration(String operation, Stopwatch sw) {
+  print('[TEMPO] $operation levou ${sw.elapsedMicroseconds / 1000} ms');
+}
+
 @JS('crypto')
 external JSObject get _crypto;
 
@@ -30,16 +34,21 @@ class DocumentCryptoSigner {
   JSObject get _subtle => _crypto['subtle'] as JSObject;
 
   Future<KeySetupResult> generateAndEncryptKeyPair(String password) async {
+    final totalSw = Stopwatch()..start();
+
     final rsaAlgo = JSObject();
     rsaAlgo['name'] = 'RSA-PSS'.toJS;
     rsaAlgo['modulusLength'] = 2048.toJS;
     rsaAlgo['publicExponent'] = Uint8List.fromList([1, 0, 1]).toJS;
     rsaAlgo['hash'] = 'SHA-256'.toJS;
 
+    final keyGenSw = Stopwatch()..start();
     final keyPair = await _subtle
         .callMethod<JSPromise<JSObject>>(
           'generateKey'.toJS, rsaAlgo, true.toJS, ['sign', 'verify'].jsify())
         .toDart;
+    keyGenSw.stop();
+    _logDuration('Geração de Chaves RSA', keyGenSw);
 
     final privateKey = keyPair['privateKey'] as JSObject;
     final publicKey  = keyPair['publicKey']  as JSObject;
@@ -86,6 +95,9 @@ class DocumentCryptoSigner {
       'ciphertext': base64Encode(ciphertext),
     }));
 
+    totalSw.stop();
+    _logDuration('Geração de Chaves RSA (total: chave + criptografia do arquivo)', totalSw);
+
     return KeySetupResult(
       publicKeyPem: _toPem('PUBLIC KEY', pubBytes),
       encryptedKeyFile: Uint8List.fromList(fileBytes),
@@ -97,6 +109,8 @@ class DocumentCryptoSigner {
     Uint8List encryptedKeyFile,
     String password,
   ) async {
+    final totalSw = Stopwatch()..start();
+
     final Map<String, dynamic> fileData;
     try {
       fileData = jsonDecode(utf8.decode(encryptedKeyFile)) as Map<String, dynamic>;
@@ -140,6 +154,7 @@ class DocumentCryptoSigner {
     signAlgo['name'] = 'RSA-PSS'.toJS;
     signAlgo['saltLength'] = 32.toJS;
 
+    final signSw = Stopwatch()..start();
     final sigBuffer = await _subtle
         .callMethod<JSPromise<JSArrayBuffer>>(
           'sign'.toJS,
@@ -148,6 +163,11 @@ class DocumentCryptoSigner {
           Uint8List.fromList(utf8.encode(documentHash)).toJS,
         )
         .toDart;
+    signSw.stop();
+    _logDuration('Geração da Assinatura (RSA-PSS sobre o hash)', signSw);
+
+    totalSw.stop();
+    _logDuration('Geração da Assinatura (total: decifrar chave + assinar)', totalSw);
 
     return DocumentSignatureResult(
       signatureBase64: base64Encode(Uint8List.view(sigBuffer.toDart)),
