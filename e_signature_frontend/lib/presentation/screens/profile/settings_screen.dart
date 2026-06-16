@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../../theme/app_colors.dart';
-import '../documents/facial_recognition_screen.dart';
 import 'edit_profile_screen.dart';
 import '../auth/change_password_screen.dart';
 import '../../providers/auth_provider.dart';
@@ -77,30 +76,6 @@ class SettingsScreen extends StatelessWidget {
                 ),
               );
             },
-          ),
-          const SizedBox(height: 32),
-          _buildSectionTitle('Segurança'),
-          const SizedBox(height: 16),
-          _buildSettingsTile(
-            icon: Icons.face_retouching_natural_outlined,
-            title: 'Validação Biométrica (Facial)',
-            subtitle: 'Configure o reconhecimento facial para assinar',
-            onTap: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => FacialRecognitionScreen(
-                    userId: user['user_id'].toString(),
-                  ),
-                ),
-              );
-            },
-          ),
-          _buildSettingsTile(
-            icon: Icons.notifications_outlined,
-            title: 'Notificações',
-            subtitle: 'Gerencie suas preferências de notificação',
-            onTap: () {},
           ),
           const SizedBox(height: 40),
           _buildLogoutButton(context),
@@ -181,8 +156,10 @@ class SettingsScreen extends StatelessWidget {
           ),
         ),
         onPressed: () async {
-          await Provider.of<AuthProvider>(context, listen: false).logout();
-          Navigator.pushReplacementNamed(context, '/login');
+          final navigator = Navigator.of(context);
+          final auth = Provider.of<AuthProvider>(context, listen: false);
+          await auth.logout();
+          navigator.pushReplacementNamed('/login');
         },
         style: TextButton.styleFrom(
           padding: const EdgeInsets.symmetric(vertical: 16),

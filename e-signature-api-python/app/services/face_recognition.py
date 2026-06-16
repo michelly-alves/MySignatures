@@ -43,31 +43,17 @@ def extract_face_embedding_from_bytes(image_bytes: bytes) -> np.ndarray:
     return faces[0].embedding
 
 
-def extract_face_pose_from_bytes(image_bytes: bytes) -> float:
+def _yaw_from_face(face) -> float:
     """
-    Retorna o ângulo de yaw (rotação horizontal) da face em graus.
+    Ângulo de yaw (rotação horizontal) em graus a partir de uma face já
+    detectada pelo InsightFace.
 
-    Usa face.pose[0] do InsightFace (buffalo_l com modelo 1k3d68).
-    Fallback para estimativa via landmarks de 5 pontos se pose não estiver
-    disponível (modelos mais leves).
+    Usa face.pose[0] (buffalo_l com modelo 1k3d68). Fallback para estimativa
+    via landmarks de 5 pontos se pose não estiver disponível (modelos leves).
 
     Convenção: yaw > 0 = face virada para a direita da câmera,
                 yaw < 0 = face virada para a esquerda da câmera.
-
-    Lança ValueError se nenhum rosto for detectado ou a imagem for inválida.
     """
-    np_img = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Imagem inválida")
-
-    face_app = get_face_app()
-    faces = face_app.get(img)
-    if not faces:
-        raise ValueError("Nenhum rosto detectado no frame")
-
-    face = faces[0]
-
     if getattr(face, "pose", None) is not None:
         return float(face.pose[0])
 
@@ -79,7 +65,44 @@ def extract_face_pose_from_bytes(image_bytes: bytes) -> float:
     if eye_span < 1:
         return 0.0
     ratio = (nose_x - left_x) / eye_span
-    return (0.5 - ratio) * 90.0  
+    return (0.5 - ratio) * 90.0
+
+
+def _detect_single_face(image_bytes: bytes):
+    """Decodifica a imagem e retorna a primeira face detectada (1 inferência)."""
+    np_img = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Imagem inválida")
+
+    face_app = get_face_app()
+    faces = face_app.get(img)
+    if not faces:
+        raise ValueError("Nenhum rosto detectado no frame")
+    return faces[0]
+
+
+def extract_face_pose_from_bytes(image_bytes: bytes) -> float:
+    """
+    Retorna o ângulo de yaw (rotação horizontal) da face em graus.
+
+    Lança ValueError se nenhum rosto for detectado ou a imagem for inválida.
+    """
+    return _yaw_from_face(_detect_single_face(image_bytes))
+
+
+def extract_face_embedding_and_yaw_from_bytes(image_bytes: bytes) -> tuple[np.ndarray, float]:
+    """
+    Extrai o embedding facial E o ângulo de yaw de uma imagem em UMA única
+    inferência do InsightFace, evitando detectar a mesma face duas vezes.
+
+    Usado no frame frontal da prova de vida, que precisa tanto do embedding
+    (comparação biométrica) quanto do yaw (validação de pose frontal).
+
+    Lança ValueError se nenhum rosto for detectado ou a imagem for inválida.
+    """
+    face = _detect_single_face(image_bytes)
+    return face.embedding, _yaw_from_face(face)
 
 
 def compare_embeddings(stored_embedding, selfie_embedding) -> float:

@@ -6,7 +6,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from cryptography.hazmat.primitives import serialization
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,6 +26,15 @@ _MONTHS_PT = [
     "janeiro", "fevereiro", "março", "abril", "maio", "junho",
     "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
 ]
+
+_MAX_VERIFY_FILE_SIZE = 10 * 1024 * 1024 
+
+_SIGNER_STATUS_LABELS = {
+    1: "Aguardando assinatura",
+    2: "Identidade verificada — falta assinar",
+    3: "Falha na verificação de identidade",
+    4: "Assinou",
+}
 
 
 def _mask_signer_name(full_name: str | None) -> str:
@@ -152,6 +161,24 @@ async def validate_signature_publicly(
         f"{signature.validation_code}/original"
     )
 
+    roster = await signature_service.get_document_signers_overview(
+        db, document.document_id
+    )
+    signers_payload = [
+        {
+            "nome": _mask_signer_name(item["full_name"]),
+            "assinou": item["status_id"] == 4,
+            "status": _SIGNER_STATUS_LABELS.get(item["status_id"], "Pendente"),
+            "assinado_em": (
+                _format_signed_at(item["signed_at"]) if item["signed_at"] else None
+            ),
+            "codigo_de_validacao": item["validation_code"],
+        }
+        for item in roster
+    ]
+    signed_count = sum(1 for item in roster if item["status_id"] == 4)
+    total_signers = len(roster)
+
     return {
         "valido": is_valid,
         "status": (
@@ -178,6 +205,17 @@ async def validate_signature_publicly(
         },
 
         "assinado_em": _format_signed_at(signature.signed_at),
+
+        "signatarios_do_documento": {
+            "total": total_signers,
+            "assinaram": signed_count,
+            "todos_assinaram": total_signers > 0 and signed_count == total_signers,
+            "observacao": (
+                "Lista de todos os signatários deste documento e o status de "
+                "cada um. Nomes parcialmente mascarados (LGPD)."
+            ),
+            "lista": signers_payload,
+        },
 
         "documento": {
             "hash_sha256": document.hash_sha256,
@@ -312,3 +350,107 @@ async def download_original_document(
             "X-Document-SHA256": actual_hash,
         },
     )
+
+
+@router.post("/{validation_code}/verify-integrity", responses=(
+    err(400, "Arquivo inválido", "Envie um arquivo PDF não vazio.") |
+    err(404, "Não encontrado", "Assinatura não encontrada.") |
+    err(413, "Arquivo muito grande", "O arquivo enviado excede o limite de 10MB.") |
+    _500
+))
+async def verify_document_integrity(
+    validation_code: str,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Verifica, de forma pública e independente, se uma CÓPIA do documento
+    fornecida pelo verificador continua íntegra em relação ao que foi
+    assinado sob este código de validação.
+
+    O verificador envia o arquivo (normalmente o PDF SELADO baixado após a
+    assinatura); o servidor recalcula o SHA-256 e o compara com dois valores
+    de referência registrados no momento da assinatura:
+
+      - ``signed_file_sha256``: hash do PDF SELADO entregue ao usuário — é a
+        verificação de integridade PÓS-ASSINATURA (o documento final não foi
+        alterado depois de assinado);
+      - ``hash_sha256``: hash do PDF ORIGINAL (anterior ao selo) — referência
+        probatória do conteúdo assinado.
+
+    A resposta indica contra qual referência o arquivo correspondeu, de modo
+    que enviar o selado ou o original produza um resultado correto e
+    informativo.
+    """
+    row = await signature_service.get_document_and_signature_by_validation_code(
+        db, validation_code
+    )
+    if not row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Assinatura não encontrada.",
+        )
+    document, signature = row
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Envie um arquivo PDF não vazio.",
+        )
+    if len(file_bytes) > _MAX_VERIFY_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="O arquivo enviado excede o limite de 10MB.",
+        )
+
+    computed_hash = await asyncio.to_thread(
+        lambda: hashlib.sha256(file_bytes).hexdigest()
+    )
+
+    matches_signed = (
+        signature.signed_file_sha256 is not None
+        and computed_hash == signature.signed_file_sha256
+    )
+    matches_original = computed_hash == document.hash_sha256
+    integro = matches_signed or matches_original
+
+    if matches_signed:
+        versao = "selado"
+        status_msg = "Documento assinado íntegro"
+        mensagem = (
+            "O arquivo enviado é o documento SELADO entregue após a "
+            "assinatura e não sofreu nenhuma alteração desde então."
+        )
+    elif matches_original:
+        versao = "original"
+        status_msg = "Documento original íntegro"
+        mensagem = (
+            "O arquivo enviado é o documento ORIGINAL (anterior ao selo "
+            "visual) e corresponde exatamente ao conteúdo que foi assinado."
+        )
+    else:
+        versao = None
+        status_msg = "Documento adulterado ou não corresponde a esta assinatura"
+        mensagem = (
+            "O arquivo enviado NÃO corresponde nem ao documento selado nem ao "
+            "original desta assinatura. Ele pode ter sido alterado após a "
+            "assinatura."
+        )
+        logger.info(
+            "Verificação de integridade por upload falhou (hash divergente). "
+            "validation_code=%s",
+            validation_code,
+        )
+
+    return {
+        "integro": integro,
+        "versao_correspondente": versao,  # "selado" | "original" | None
+        "status": status_msg,
+        "mensagem": mensagem,
+        "codigo_de_validacao": validation_code,
+        "algoritmo_de_hash": "SHA-256",
+        "hash_do_arquivo_enviado": computed_hash,
+        "hash_documento_selado": signature.signed_file_sha256,
+        "hash_documento_original": document.hash_sha256,
+    }

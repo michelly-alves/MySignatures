@@ -7,6 +7,8 @@ class DocumentSignerResponse(BaseModel):
     document_id: int
     signer_id: int
     status_id: int
+    signer_name: Optional[str] = None
+    signer_email: Optional[str] = None
     face_match_score: Optional[float]
     verified_at: Optional[datetime]
 

@@ -1,8 +1,12 @@
 from fastapi import status
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+import base64
 import logging
+from datetime import datetime, timezone
+
+from cryptography.hazmat.primitives import serialization
 
 from app.services.user_service import *
 from app.schemas.user import *
@@ -11,9 +15,20 @@ from app.dependencies.auth import get_current_user, get_optional_current_user, r
 from app.security.roles import require_roles
 from app.models.user import Role, User
 from app.models.signer import Signer
+from app.models.signer_key_history import SignerKeyHistory
+from app.models.audit_log import AuditLog
+from app.services.face_recognition import (
+    compare_embeddings,
+    extract_face_embedding_from_bytes,
+)
+from app.services.signature_service import _same_public_key
+from app.utils.timing import log_duration
 from sqlalchemy.exc import SQLAlchemyError
 from app.api.v1.responses import err, _401, _422, _500
 from pydantic import BaseModel
+
+# Limiar de similaridade facial (cosseno), idêntico ao de face_verification.
+FACE_SIMILARITY_THRESHOLD = 0.6
 
 router = APIRouter(prefix="/api")
 
@@ -223,3 +238,126 @@ async def register_signing_key(
     signer.public_key = payload.public_key_pem
     await db.commit()
     return {"message": "Chave de assinatura registrada com sucesso."}
+
+
+class _RotateKeyRequest(BaseModel):
+    new_public_key_pem: str
+    live_image_base64: str
+
+
+@router.post(
+    "/signer/rotate-key",
+    responses=(
+        _401 |
+        err(400, "Dados inválidos", "Nova chave pública inválida ou igual à atual.") |
+        err(403, "Falha na verificação", "Verificação facial não confirmou a identidade.") |
+        err(404, "Não encontrado", "Signatário ou chave atual não encontrados.") |
+        _500
+    ),
+)
+async def rotate_signing_key(
+    payload: _RotateKeyRequest,
+    request: Request,
+    current_user: User = Depends(require_otp_verified),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Rotaciona a chave de assinatura do signatário (perda do .ekey ou da senha).
+
+    Exige re-autenticação forte: OTP verificado (via require_otp_verified) +
+    verificação facial em tempo real contra a biometria cadastrada. A chave
+    antiga é revogada e movida para signer_key_history; assinaturas anteriores
+    permanecem válidas, pois cada uma guarda a chave usada no momento.
+
+    NÃO há recuperação da chave perdida (posse exclusiva): gera-se uma nova.
+    """
+    if current_user.role != Role.SIGNER:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Apenas signatários podem rotacionar a chave de assinatura.",
+        )
+
+    result = await db.execute(
+        select(Signer)
+        .where(Signer.user_id == current_user.user_id, Signer.deleted_at.is_(None))
+        .order_by(Signer.signer_id.desc())
+    )
+    signer = result.scalars().first()
+    if not signer:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Signatário não encontrado.")
+    if not signer.public_key:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Não há chave registrada para rotacionar. Registre a chave primeiro.",
+        )
+    if not signer.face_embedding:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Biometria não cadastrada; rotação não pode ser autenticada.",
+        )
+
+    # Valida a nova chave pública e garante que é realmente diferente da atual.
+    try:
+        serialization.load_pem_public_key(payload.new_public_key_pem.encode("utf-8"))
+    except Exception:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Nova chave pública inválida.")
+    if _same_public_key(payload.new_public_key_pem, signer.public_key):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "A nova chave é igual à atual; gere um novo par de chaves.",
+        )
+
+    # Re-verificação facial contra a biometria cadastrada.
+    try:
+        image_bytes = base64.b64decode(payload.live_image_base64)
+    except Exception:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Imagem inválida.")
+    try:
+        with log_duration(logger, "Rotação de Chave (verificação facial)", user_id=current_user.user_id):
+            live_embedding = extract_face_embedding_from_bytes(image_bytes)
+            similarity = compare_embeddings(
+                stored_embedding=signer.face_embedding,
+                selfie_embedding=live_embedding,
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Erro na verificação facial durante rotação de chave")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Rosto não detectado na imagem enviada.")
+
+    if similarity < FACE_SIMILARITY_THRESHOLD:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Verificação facial não confirmou a identidade. Rotação cancelada.",
+        )
+
+    # Revoga a chave antiga (histórico) e ativa a nova.
+    old_public_key = signer.public_key
+    db.add(SignerKeyHistory(
+        signer_id=signer.signer_id,
+        public_key=old_public_key,
+        reason="Rotação por perda de chave/senha (re-verificação facial + OTP)",
+        revoked_by=current_user.user_id,
+    ))
+    signer.public_key = payload.new_public_key_pem
+    signer.updated_at = datetime.now(tz=timezone.utc)
+
+    db.add(AuditLog(
+        user_id=current_user.user_id,
+        entity_name="signer",
+        entity_id=signer.signer_id,
+        action="SIGNER_KEY_ROTATED",
+        description=(
+            f"Chave de assinatura rotacionada. signer_id={signer.signer_id}; "
+            f"similaridade_facial={similarity:.4f}"
+        ),
+        ip_address=request.client.host if request.client else None,
+    ))
+
+    await db.commit()
+    logger.info(
+        "Chave de assinatura rotacionada | signer_id=%s | user_id=%s",
+        signer.signer_id,
+        current_user.user_id,
+    )
+    return {"message": "Chave de assinatura rotacionada com sucesso."}

@@ -19,11 +19,13 @@ enum CaptureState {
 class FacialRecognitionScreen extends StatefulWidget {
   final String userId;
   final int? documentId;
+  final bool captureOnly;
 
   const FacialRecognitionScreen({
     super.key,
     required this.userId,
     this.documentId,
+    this.captureOnly = false,
   });
 
   @override
@@ -139,11 +141,7 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
     try {
       final XFile photo = await controller.takePicture();
 
-      // Null the field first so _buildCameraUI returns a spinner if rebuilt,
-      // then wait for AnimatedSwitcher's 300ms exit animation to complete before
-      // disposing — CameraPreview's ValueListenableBuilder would otherwise call
-      // buildPreview() on an already-disposed controller during the animation.
-      _controller = null;
+     _controller = null;
       await Future.delayed(const Duration(milliseconds: 350));
       await _disposeController(controller);
 
@@ -152,6 +150,12 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
 
       final bytes = await photo.readAsBytes();
       final base64Image = base64Encode(bytes);
+
+      if (widget.captureOnly) {
+        if (!mounted) return;
+        Navigator.of(context).pop(base64Image);
+        return;
+      }
 
       if (_isDocumentLiveness) {
         final step = _challengeSteps[_challengeIndex]['key']!;
@@ -164,9 +168,15 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
           return;
         }
 
+        final livenessSw = Stopwatch()..start();
         final success = await _authRepository.verifyDocumentLiveness(
           documentId: widget.documentId!,
           frames: _livenessFrames,
+        );
+        livenessSw.stop();
+        debugPrint(
+          '[TEMPO] Prova de Vida (round-trip) levou '
+          '${livenessSw.elapsedMilliseconds} ms',
         );
 
         if (!mounted) return;
@@ -174,15 +184,21 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
         setState(() {
           _verificationSuccess = success;
           _message = success
-              ? "Prova de vida validada com sucesso!"
+              ? "Validação realizada com sucesso!"
               : "Não foi possível validar rosto e movimentação.";
           _state = CaptureState.result;
         });
         return;
       }
 
+      final faceSw = Stopwatch()..start();
       final success =
           await _authRepository.verifyFace(base64Image, widget.userId);
+      faceSw.stop();
+      debugPrint(
+        '[TEMPO] Reconhecimento Facial (round-trip) levou '
+        '${faceSw.elapsedMilliseconds} ms',
+      );
 
       if (!mounted) return;
 

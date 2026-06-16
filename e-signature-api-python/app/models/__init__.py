@@ -16,6 +16,7 @@ from .accumulator import (
     Witness,
 )
 from .signer_status import SignerStatusModel
+from .signer_key_history import SignerKeyHistory
 from .otp_codes import OtpCode
 from .auth_log import AuthLog
 from .identity_document import IdentityDocument

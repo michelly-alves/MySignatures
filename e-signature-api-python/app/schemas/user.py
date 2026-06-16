@@ -4,6 +4,7 @@ from datetime import datetime
 from enum import IntEnum
 from app.models.user import Role
 from pydantic import field_validator, model_validator
+from app.security.password import validate_password_strength
 import re
 
 class Role(IntEnum):
@@ -29,11 +30,7 @@ class CreateUser(BaseModel):
     @field_validator("password")
     @classmethod
     def validate_password(cls, value: str):
-        if not value or not value.strip():
-            raise ValueError("A senha é obrigatória")
-        if len(value) < 8:
-            raise ValueError("A senha deve ter pelo menos 8 caracteres")
-        return value
+        return validate_password_strength(value)
 
     @field_validator(
         "legal_name",

@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.accumulator import AccumulatorElement, AccumulatorState, Witness
@@ -30,7 +30,30 @@ from app.utils.timing import log_duration
 logger = logging.getLogger(__name__)
 
 SIGNED_DOCUMENT_STATUS = 3
+DOCUMENT_STATUS_IN_PROGRESS = 2
 SIGNED_SIGNER_STATUS = SignerStatus.SIGNED.value  # = 4
+
+
+def _same_public_key(pem_a: str, pem_b: str) -> bool:
+    """
+    Compara duas chaves públicas pelo conteúdo criptográfico (DER do
+    SubjectPublicKeyInfo), tolerando diferenças de formatação do PEM
+    (quebras de linha, espaços). Retorna False se qualquer uma for inválida.
+    """
+    try:
+        key_a = serialization.load_pem_public_key(pem_a.encode("utf-8"))
+        key_b = serialization.load_pem_public_key(pem_b.encode("utf-8"))
+        der_a = key_a.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        der_b = key_b.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return der_a == der_b
+    except Exception:
+        return False
 
 
 def _verify_rsa_signature(public_key_pem: str, document_hash: str, signature_base64: str) -> None:
@@ -123,6 +146,28 @@ def _build_event_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+async def _gather_seal_entries(db: AsyncSession, document_id: int) -> list[dict]:
+    """
+    Dados de todos os signatários que já assinaram o documento, em ordem de
+    assinatura — usados para carimbar o selo consolidado do PDF final.
+    """
+    result = await db.execute(
+        select(DigitalSignature, Signer)
+        .join(Signer, Signer.signer_id == DigitalSignature.signer_id)
+        .where(DigitalSignature.doc_sign_id == document_id)
+        .order_by(DigitalSignature.signature_id)
+    )
+    return [
+        {
+            "full_name": signer.full_name,
+            "signed_at": signature.signed_at,
+            "validation_code": signature.validation_code,
+            "validation_url": signature.validation_url,
+        }
+        for signature, signer in result.all()
+    ]
+
+
 async def sign_document(
     db: AsyncSession,
     user: User,
@@ -148,6 +193,9 @@ async def sign_document(
     if not document_signer:
         raise PermissionError("Documento não pertence ao signatário autenticado")
 
+    if document_signer.status_id == SIGNED_SIGNER_STATUS:
+        raise ValueError("Você já assinou este documento.")
+
     if document_signer.status_id != SignerStatus.IDENTITY_VERIFIED.value:
         raise ValueError("Realize a verificação facial antes de assinar")
 
@@ -160,9 +208,6 @@ async def sign_document(
     document = result.scalar_one_or_none()
     if not document:
         raise LookupError("Documento não encontrado")
-
-    if document.status_id == SIGNED_DOCUMENT_STATUS:
-        raise ValueError("Documento já foi assinado e não pode ser assinado novamente.")
 
     with log_duration(
         logger,
@@ -190,9 +235,20 @@ async def sign_document(
             "corresponde ao hash registrado no upload. Assinatura abortada."
         )
 
-    public_key_pem = payload.public_key_pem or signer.public_key
-    if not public_key_pem:
-        raise ValueError("Chave pública do signatário não informada")
+    registered_pem = signer.public_key
+    provided_pem = payload.public_key_pem
+
+    if registered_pem:
+        if provided_pem and not _same_public_key(provided_pem, registered_pem):
+            raise ValueError(
+                "A chave pública usada na assinatura não corresponde à chave "
+                "registrada do signatário."
+            )
+        public_key_pem = registered_pem
+    else:
+        if not provided_pem:
+            raise ValueError("Chave pública do signatário não informada")
+        public_key_pem = provided_pem
 
     _verify_rsa_signature(
         public_key_pem=public_key_pem,
@@ -211,8 +267,9 @@ async def sign_document(
         ip_address=ip_address,
         validation_code=_new_validation_code(),
     )
+
     digital_signature.validation_url = (
-        f"{settings.PUBLIC_BASE_URL}/public/signatures/{digital_signature.validation_code}"
+        f"{settings.FRONTEND_BASE_URL}/validate?code={digital_signature.validation_code}"
     )
     db.add(digital_signature)
     await db.flush()
@@ -239,30 +296,45 @@ async def sign_document(
             created_by=user.user_id,
         )
 
-    document.status_id = SIGNED_DOCUMENT_STATUS
-    document.updated_at = datetime.utcnow()
     document_signer.status_id = SIGNED_SIGNER_STATUS
     document_signer.verified_at = document_signer.verified_at or datetime.utcnow()
+    document.updated_at = datetime.utcnow()
 
     await db.flush()
-    try:
-        with log_duration(
-            logger,
-            "Geração do PDF Selado",
-            document_id=document.document_id,
-            signature_id=digital_signature.signature_id,
-        ):
-            digital_signature.signed_file_path = create_signed_pdf_seal(
-                document=document,
-                signer=signer,
-                signature=digital_signature,
-                state=accumulator.state,
-                element=accumulator.element,
-                witness=accumulator.witness,
-                previous_state=accumulator.previous_state,
-            )
-    except RuntimeError as exc:
-        raise ValueError(str(exc)) from exc
+
+    pending_signers = await db.scalar(
+        select(func.count())
+        .select_from(DocumentSigner)
+        .where(
+            DocumentSigner.document_id == document_id,
+            DocumentSigner.status_id != SIGNED_SIGNER_STATUS,
+        )
+    )
+    all_signed = pending_signers == 0
+
+    document.status_id = SIGNED_DOCUMENT_STATUS if all_signed else DOCUMENT_STATUS_IN_PROGRESS
+
+    if all_signed:
+        seal_entries = await _gather_seal_entries(db, document_id)
+        try:
+            with log_duration(
+                logger,
+                "Geração do PDF Selado (consolidado)",
+                document_id=document.document_id,
+                signature_id=digital_signature.signature_id,
+            ):
+                digital_signature.signed_file_path = create_signed_pdf_seal(
+                    document=document,
+                    entries=seal_entries,
+                    state=accumulator.state,
+                    previous_state=accumulator.previous_state,
+                )
+        except RuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+
+        digital_signature.signed_file_sha256 = await asyncio.to_thread(
+            compute_file_sha256, digital_signature.signed_file_path
+        )
 
     audit_description = _build_signature_audit_description(
         document=document,
@@ -397,6 +469,38 @@ async def get_document_signature_summary(db: AsyncSession, document_id: int):
     }
 
 
+async def get_document_signers_overview(db: AsyncSession, document_id: int) -> list[dict]:
+    """
+    Visão de TODOS os signatários do documento e o status de cada um (quem já
+    assinou e quem falta), para a validação pública. Para quem assinou, inclui
+    o respectivo código de validação individual.
+    """
+    rows = await db.execute(
+        select(DocumentSigner, Signer)
+        .join(Signer, Signer.signer_id == DocumentSigner.signer_id)
+        .where(DocumentSigner.document_id == document_id)
+        .order_by(DocumentSigner.signer_id)
+    )
+    signer_rows = rows.all()
+
+    sig_rows = await db.execute(
+        select(DigitalSignature).where(DigitalSignature.doc_sign_id == document_id)
+    )
+    signature_by_signer = {s.signer_id: s for s in sig_rows.scalars().all()}
+
+    overview: list[dict] = []
+    for document_signer, signer in signer_rows:
+        signature = signature_by_signer.get(signer.signer_id)
+        overview.append({
+            "signer_id": signer.signer_id,
+            "full_name": signer.full_name,
+            "status_id": document_signer.status_id,
+            "signed_at": signature.signed_at if signature else None,
+            "validation_code": signature.validation_code if signature else None,
+        })
+    return overview
+
+
 async def get_document_by_validation_code(
     db: AsyncSession,
     validation_code: str,
@@ -407,6 +511,25 @@ async def get_document_by_validation_code(
         .where(DigitalSignature.validation_code == validation_code)
     )
     return result.scalars().first()
+
+
+async def get_document_and_signature_by_validation_code(
+    db: AsyncSession,
+    validation_code: str,
+) -> tuple[Document, DigitalSignature] | None:
+    """
+    Documento e respectiva assinatura digital a partir do código de validação.
+    Suficiente para a verificação de integridade (hash do original em
+    Document.hash_sha256 e hash do PDF selado em
+    DigitalSignature.signed_file_sha256).
+    """
+    result = await db.execute(
+        select(Document, DigitalSignature)
+        .join(DigitalSignature, DigitalSignature.doc_sign_id == Document.document_id)
+        .where(DigitalSignature.validation_code == validation_code)
+        .order_by(DigitalSignature.signature_id.desc())
+    )
+    return result.first()
 
 
 async def get_latest_signature_for_document(

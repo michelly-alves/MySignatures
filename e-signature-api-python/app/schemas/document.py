@@ -1,19 +1,25 @@
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, EmailStr
+
+
+class SignerInput(BaseModel):
+    full_name: str
+    phone_number: str
+    email: EmailStr
+    national_id: str
+    photo_id_url: Optional[str] = None
+
 
 class CreateDocument(BaseModel):
     company_id: int
     status_id: int = 1
 
-    signer_full_name: Optional[str]
-    signer_phone_number: Optional[str]
-    signer_email: Optional[EmailStr]
-    signer_national_id: Optional[str]
+    file_name: Optional[str] = None
+    file_path: Optional[str] = None
+    hash_sha256: Optional[str] = None
 
-    file_name: Optional[str]
-    file_path: Optional[str]
-    hash_sha256: Optional[str]
-    photo_id_url: Optional[str]
+    signers: List[SignerInput] = []
+
 
 class UpdateDocument(BaseModel):
-    status_id: Optional[int]
+    status_id: Optional[int] = None

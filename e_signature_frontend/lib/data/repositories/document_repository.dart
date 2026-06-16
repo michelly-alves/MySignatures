@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/constants/api_constants.dart';
+import '../../core/utils/session_manager.dart';
 import '../models/document_model.dart';
 import '../models/document_signature_summary_model.dart';
 import '../models/document_signer_model.dart';
@@ -25,6 +26,8 @@ class DocumentRepository {
           'Authorization': 'Bearer $token',
         },
       );
+
+      SessionManager.isUnauthorized(response.statusCode);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);
@@ -55,6 +58,8 @@ class DocumentRepository {
       },
     );
 
+    SessionManager.isUnauthorized(response.statusCode);
+
     if (response.statusCode == 200) {
       final List<dynamic> data = jsonDecode(response.body);
 
@@ -72,17 +77,14 @@ class DocumentRepository {
   }
 }
 
-  Future<String?> createDocumentWithFiles({
+  /// Cria um documento com um ou mais signatários (modelo paralelo).
+  /// [signers] e [photos] devem estar na MESMA ordem (uma foto por signatário).
+  Future<String?> createDocumentWithSigners({
     required int companyId,
-    required int statusId,
     required String documentFileName,
     required Uint8List documentFileBytes,
-    required String signerFullName,
-    required String signerPhoneNumber,
-    required String signerEmail,
-    required String signerNationalId,
-    required String photoIdFileName,
-    required Uint8List photoIdFileBytes,
+    required List<Map<String, String>> signers,
+    required List<({String name, Uint8List bytes})> photos,
   }) async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -92,13 +94,12 @@ class DocumentRepository {
       final dio = Dio();
       final formData = FormData.fromMap({
         'company_id': companyId,
-        'status_id': statusId,
-        'signer_full_name': signerFullName,
-        'signer_phone_number': signerPhoneNumber,
-        'signer_email': signerEmail,
-        'signer_national_id': signerNationalId,
+        'signers': jsonEncode(signers),
         'document_file': MultipartFile.fromBytes(documentFileBytes, filename: documentFileName),
-        'signer_photo_id_file': MultipartFile.fromBytes(photoIdFileBytes, filename: photoIdFileName),
+        'signer_photos': [
+          for (final photo in photos)
+            MultipartFile.fromBytes(photo.bytes, filename: photo.name),
+        ],
       });
 
       final response = await dio.post(
@@ -109,6 +110,10 @@ class DocumentRepository {
 
       return response.statusCode == 201 ? null : 'Erro ao criar documento. Código: ${response.statusCode}';
     } on DioException catch (e) {
+      if (e.response?.statusCode == 401) {
+        SessionManager.handleUnauthorized();
+        return 'Sessão expirada. Faça login novamente.';
+      }
       final data = e.response?.data;
       if (data is Map && data['detail'] != null) return data['detail'].toString();
       debugPrint('Erro ao criar documento: ${e.message}');
@@ -136,6 +141,8 @@ class DocumentRepository {
         'Authorization': 'Bearer $token',
       },
     );
+
+    SessionManager.isUnauthorized(response.statusCode);
 
     if (response.statusCode == 200) {
       return DocumentSignatureSummary.fromJson(jsonDecode(response.body));

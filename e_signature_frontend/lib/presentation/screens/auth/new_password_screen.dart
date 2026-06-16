@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:http/http.dart' as http;
 import '../../../core/constants/api_constants.dart';
+import '../../../core/utils/password_validator.dart';
 import '../../../theme/app_colors.dart';
 import 'login_screen.dart';
 
@@ -19,6 +20,7 @@ class SetPasswordScreen extends StatefulWidget {
 class _SetPasswordScreenState extends State<SetPasswordScreen> {
   final TextEditingController _passwordController = TextEditingController();
   final TextEditingController _confirmPasswordController = TextEditingController();
+  final Map<TextEditingController, bool> _obscure = {};
   bool _isLoading = false;
   String? token;
 
@@ -35,6 +37,17 @@ class _SetPasswordScreenState extends State<SetPasswordScreen> {
         const SnackBar(
           backgroundColor: Colors.redAccent,
           content: Text('Preencha todos os campos.'),
+        ),
+      );
+      return;
+    }
+
+    final strengthError = PasswordValidator.validate(_passwordController.text);
+    if (strengthError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: Colors.redAccent,
+          content: Text(strengthError),
         ),
       );
       return;
@@ -225,15 +238,28 @@ class _SetPasswordScreenState extends State<SetPasswordScreen> {
     required String hint,
     bool isPassword = false,
   }) {
+    final obscure = _obscure[controller] ?? true;
     return TextFormField(
       controller: controller,
-      obscureText: isPassword,
+      obscureText: isPassword && obscure,
       style: GoogleFonts.poppins(),
       decoration: InputDecoration(
         hintText: hint,
         hintStyle: GoogleFonts.poppins(color: Colors.grey[400], fontSize: 14),
         filled: true,
         fillColor: Colors.white,
+        suffixIcon: isPassword
+            ? IconButton(
+                icon: Icon(
+                  obscure
+                      ? Icons.visibility_outlined
+                      : Icons.visibility_off_outlined,
+                  color: Colors.grey,
+                ),
+                onPressed: () =>
+                    setState(() => _obscure[controller] = !obscure),
+              )
+            : null,
         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(12),

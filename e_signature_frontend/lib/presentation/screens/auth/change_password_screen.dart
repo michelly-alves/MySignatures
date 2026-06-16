@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../../../core/utils/password_validator.dart';
+import '../../../data/repositories/auth_repository.dart';
 import '../../../theme/app_colors.dart';
 
 class ChangePasswordScreen extends StatefulWidget {
@@ -17,6 +19,8 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   final TextEditingController _newPasswordController = TextEditingController();
   final TextEditingController _confirmPasswordController =
       TextEditingController();
+  final Map<TextEditingController, bool> _obscure = {};
+  final _authRepository = AuthRepository();
 
   bool _isLoading = false;
 
@@ -31,26 +35,34 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   Future<void> _changePassword() async {
     if (!_formKey.currentState!.validate()) return;
 
-    setState(() {
-      _isLoading = true;
-    });
+    setState(() => _isLoading = true);
 
-    try {
-      await Future.delayed(const Duration(seconds: 2));
+    final messenger = ScaffoldMessenger.of(context);
+    final navigator = Navigator.of(context);
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Senha alterada com sucesso!")),
+    final result = await _authRepository.changePassword(
+      currentPassword: _currentPasswordController.text,
+      newPassword: _newPasswordController.text,
+    );
+
+    if (!mounted) return;
+    setState(() => _isLoading = false);
+
+    if (result.ok) {
+      messenger.showSnackBar(
+        const SnackBar(
+          backgroundColor: Colors.green,
+          content: Text("Senha alterada com sucesso!"),
+        ),
       );
-
-      Navigator.pop(context);
-    } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text("Erro ao alterar senha: $e")),
+      navigator.pop();
+    } else {
+      messenger.showSnackBar(
+        SnackBar(
+          backgroundColor: Colors.redAccent,
+          content: Text(result.error ?? "Erro ao alterar senha."),
+        ),
       );
-    } finally {
-      setState(() {
-        _isLoading = false;
-      });
     }
   }
 
@@ -120,15 +132,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                     controller: _newPasswordController,
                     label: "Nova Senha",
                     icon: Icons.lock_outline,
-                    validator: (value) {
-                      if (value == null || value.isEmpty) {
-                        return "Digite a nova senha";
-                      }
-                      if (value.length < 6) {
-                        return "A senha deve ter no mínimo 6 caracteres";
-                      }
-                      return null;
-                    },
+                    validator: PasswordValidator.validate,
                   ),
                   const SizedBox(height: 24),
                   _buildPasswordField(
@@ -180,9 +184,10 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
     required IconData icon,
     String? Function(String?)? validator,
   }) {
+    final obscure = _obscure[controller] ?? true;
     return TextFormField(
       controller: controller,
-      obscureText: true,
+      obscureText: obscure,
       validator: validator,
       style: GoogleFonts.poppins(color: AppColors.primaryText),
       decoration: InputDecoration(
@@ -192,6 +197,13 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
             GoogleFonts.poppins(color: AppColors.primaryText.withValues(alpha: 0.7)),
         filled: true,
         fillColor: AppColors.textFieldFill,
+        suffixIcon: IconButton(
+          icon: Icon(
+            obscure ? Icons.visibility_outlined : Icons.visibility_off_outlined,
+            color: Colors.grey,
+          ),
+          onPressed: () => setState(() => _obscure[controller] = !obscure),
+        ),
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(12),
           borderSide: BorderSide.none,

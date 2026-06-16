@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 
 from app.core.config import settings
 from app.db import get_db
@@ -14,7 +14,8 @@ from app.models.user import User
 from app.models.auth_models import ResetPasswordToken, NotificationToken
 from app.schemas.auth import LoginRequest, TokenResponse
 from app.security.jwt import create_jwt, validate_notification_jwt
-from app.security.password import verify_password, hash_password
+from app.security.password import verify_password, hash_password, validate_password_strength
+from app.dependencies.auth import get_current_user
 from app.utils.email import send_forgot_password_email
 from app.api.v1.responses import err, _401, _422, _500
 
@@ -237,6 +238,11 @@ class SetPasswordRequest(BaseModel):
     token: str
     new_password: str
 
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, value: str):
+        return validate_password_strength(value)
+
 
 @router.post("/set-password", responses=(
     err(400, "Token inválido", "Token de ativação inválido, expirado ou já utilizado.") |
@@ -311,3 +317,49 @@ async def set_password(
     await db.refresh(user)
 
     return {"message": "Senha definida com sucesso"}
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def validate_new_password(cls, value: str):
+        return validate_password_strength(value)
+
+
+@router.post("/change-password", responses=(
+    err(400, "Senha atual incorreta", "A senha atual está incorreta.") |
+    _401 |
+    _422 |
+    _500
+))
+async def change_password(
+    data: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Altera a senha do usuário autenticado.
+
+    Exige a senha atual (reautenticação) e aplica a política de força à nova
+    senha. A nova senha não pode ser igual à atual.
+    """
+    if current_user.password_hash is None or not verify_password(
+        data.current_password, current_user.password_hash
+    ):
+        raise HTTPException(status_code=400, detail="A senha atual está incorreta.")
+
+    if verify_password(data.new_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=400,
+            detail="A nova senha deve ser diferente da senha atual.",
+        )
+
+    current_user.password_hash = hash_password(data.new_password)
+    current_user.updated_at = datetime.now(tz=timezone.utc)
+
+    await db.commit()
+
+    return {"message": "Senha alterada com sucesso"}

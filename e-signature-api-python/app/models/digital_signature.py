@@ -14,4 +14,5 @@ class DigitalSignature(Base):
     validation_code = Column(String(64), nullable=True)
     validation_url = Column(Text, nullable=True)
     signed_file_path = Column(Text, nullable=True)
+    signed_file_sha256 = Column(String(64), nullable=True)
     signed_at = Column(DateTime(timezone=True), server_default=func.now())

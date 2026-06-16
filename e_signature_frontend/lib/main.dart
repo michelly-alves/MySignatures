@@ -6,6 +6,7 @@ import 'package:e_signature_frontend/presentation/screens/auth/new_password_scre
 import 'package:e_signature_frontend/presentation/screens/auth/otp_verification_screen.dart';
 import 'package:e_signature_frontend/presentation/screens/public/signature_validation_screen.dart';
 import 'package:e_signature_frontend/presentation/providers/auth_provider.dart';
+import 'package:e_signature_frontend/core/utils/session_manager.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'theme/app_colors.dart';
@@ -25,6 +26,7 @@ class MyApp extends StatelessWidget {
       create: (_) => AuthProvider(),
       child: MaterialApp(
         title: 'E-Signature App',
+        navigatorKey: SessionManager.navigatorKey,
         theme: ThemeData(
           scaffoldBackgroundColor: AppColors.background,
           primaryColor: AppColors.primaryButton,

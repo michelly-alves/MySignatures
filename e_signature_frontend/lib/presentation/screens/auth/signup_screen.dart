@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 
 import '../../../core/constants/api_constants.dart';
+import '../../../core/utils/password_validator.dart';
 import '../../../data/repositories/auth_repository.dart';
 import '../../../theme/app_colors.dart';
 import 'otp_verification_screen.dart';
@@ -18,6 +19,7 @@ class SignUpScreen extends StatefulWidget {
 class _SignUpScreenState extends State<SignUpScreen> {
   final _formKey = GlobalKey<FormState>();
   bool _isLoading = false;
+  final Map<TextEditingController, bool> _obscure = {};
 
   final _authRepository = AuthRepository();
 
@@ -56,11 +58,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
     return null;
   }
 
-  String? _validatePassword(String? v) {
-    if (v == null || v.isEmpty) return 'Campo obrigatório';
-    if (v.length < 8) return 'Senha deve ter pelo menos 8 caracteres';
-    return null;
-  }
+  String? _validatePassword(String? v) => PasswordValidator.validate(v);
 
   String? _validateCnpj(String? v) {
     if (v == null || v.trim().isEmpty) return 'Campo obrigatório';
@@ -350,6 +348,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
     TextInputType keyboardType = TextInputType.text,
     String? Function(String?)? validator,
   }) {
+    final obscure = _obscure[controller] ?? true;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -360,7 +359,7 @@ class _SignUpScreenState extends State<SignUpScreen> {
         const SizedBox(height: 8),
         TextFormField(
           controller: controller,
-          obscureText: isPassword,
+          obscureText: isPassword && obscure,
           keyboardType: keyboardType,
           validator: validator,
           autovalidateMode: AutovalidateMode.onUserInteraction,
@@ -369,6 +368,18 @@ class _SignUpScreenState extends State<SignUpScreen> {
             hintStyle: TextStyle(color: Colors.grey[400]),
             filled: true,
             fillColor: AppColors.textFieldFill,
+            suffixIcon: isPassword
+                ? IconButton(
+                    icon: Icon(
+                      obscure
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                      color: Colors.grey,
+                    ),
+                    onPressed: () =>
+                        setState(() => _obscure[controller] = !obscure),
+                  )
+                : null,
             border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
                 borderSide: const BorderSide(color: AppColors.textFieldBorder)),

@@ -40,6 +40,21 @@ class DocumentSignerService:
             return result.scalars().all()
 
         if user.role == Role.SIGNER:
+            if document_id is not None:
+                belongs = await db.execute(
+                    select(DocumentSigner.signer_id)
+                    .join(Signer, Signer.signer_id == DocumentSigner.signer_id)
+                    .where(
+                        DocumentSigner.document_id == document_id,
+                        Signer.user_id == user.user_id,
+                        Signer.deleted_at.is_(None),
+                    )
+                )
+                if belongs.first() is None:
+                    return []
+                result = await db.execute(query)
+                return result.scalars().all()
+
             query = query.join(Signer, DocumentSigner.signer_id == Signer.signer_id)
             query = query.where(
                 Signer.user_id == user.user_id,

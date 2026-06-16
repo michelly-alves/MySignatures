@@ -30,7 +30,7 @@ def generate_secure_token(length: int = 32) -> str:
     return ''.join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(length))
 
 
-async def create_document_and_signer(
+async def create_document_with_signers(
     db: AsyncSession,
     new_document: CreateDocument
 ) -> Document:
@@ -42,18 +42,8 @@ async def create_document_and_signer(
         raise ValueError("Caminho do arquivo do documento é obrigatório")
     if not new_document.hash_sha256:
         raise ValueError("Hash SHA-256 do documento é obrigatório")
-    if not new_document.signer_email:
-        raise ValueError("signer_email é obrigatório")
-    if not new_document.signer_full_name:
-        raise ValueError("signer_full_name é obrigatório")
-    if not new_document.signer_phone_number:
-        raise ValueError("signer_phone_number é obrigatório")
-    if not new_document.signer_national_id:
-        raise ValueError("signer_national_id é obrigatório")
-
-    signer_national_id = re.sub(r"\D", "", new_document.signer_national_id)
-    if len(signer_national_id) != 11:
-        raise ValueError("CPF do signatário inválido: informe 11 dígitos")
+    if not new_document.signers:
+        raise ValueError("Informe ao menos um signatário")
 
     result = await db.execute(
         select(Company).where(
@@ -75,55 +65,28 @@ async def create_document_and_signer(
     if result.scalar_one_or_none():
         raise ValueError("Este documento já foi cadastrado para esta empresa")
 
-    result = await db.execute(
-        select(User).where(User.email == new_document.signer_email)
-    )
-    user = result.scalar_one_or_none()
-    user_was_created = user is None
-    if user and user.role != Role.SIGNER:
-        raise ValueError("O e-mail informado já pertence a um usuário que não é signatário")
+    # Normaliza/valida cada signatário e detecta CPFs repetidos na própria lista.
+    normalized: list[tuple] = []
+    seen_ids: set[str] = set()
+    for input_signer in new_document.signers:
+        if not input_signer.full_name:
+            raise ValueError("Nome do signatário é obrigatório")
+        if not input_signer.email:
+            raise ValueError("E-mail do signatário é obrigatório")
+        if not input_signer.phone_number:
+            raise ValueError("Telefone do signatário é obrigatório")
 
-    if not user:
-        user = User(
-            email=new_document.signer_email,
-            password_hash=None,  
-            role=2  # SIGNER
-        )
-        db.add(user)
-        await db.flush()
+        national_id = re.sub(r"\D", "", input_signer.national_id or "")
+        if len(national_id) != 11:
+            raise ValueError(
+                f"CPF inválido para {input_signer.full_name}: informe 11 dígitos"
+            )
+        if national_id in seen_ids:
+            raise ValueError("Há CPFs repetidos na lista de signatários")
+        seen_ids.add(national_id)
+        normalized.append((input_signer, national_id))
 
-    result = await db.execute(
-        select(Signer)
-        .where(Signer.national_id == signer_national_id)
-        .where(Signer.deleted_at.is_(None))
-        .order_by(Signer.signer_id.desc())
-    )
-    signer = result.scalars().first()
-    if signer and signer.user_id != user.user_id:
-        raise ValueError("O CPF informado já pertence a outro signatário")
-
-    if not signer:
-        signer = Signer(
-            full_name=new_document.signer_full_name,
-            phone_number=new_document.signer_phone_number,
-            contact_email=new_document.signer_email,
-            national_id=signer_national_id,
-            photo_id_url=new_document.photo_id_url,
-            user_id=user.user_id
-        )
-        db.add(signer)
-        await db.flush()
-        
-    if signer.face_embedding is None:
-        if not new_document.photo_id_url:
-            raise ValueError("Foto do signatário é obrigatória para biometria")
-
-        try:
-            embedding = extract_face_embedding_from_path(new_document.photo_id_url)
-            signer.face_embedding = embedding.tolist()
-        except Exception as e:
-            raise ValueError(f"Erro ao gerar biometria facial: {str(e)}")        
-
+    # Cria o documento uma única vez.
     document = Document(
         company_id=new_document.company_id,
         file_name=new_document.file_name,
@@ -134,53 +97,118 @@ async def create_document_and_signer(
     db.add(document)
     await db.flush()
 
-    document_signer = DocumentSigner(
-        document_id=document.document_id,
-        signer_id=signer.signer_id,
-        status_id=1
-    )
-    db.add(document_signer)
+    # Vincula cada signatário; os e-mails são enviados após o commit.
+    pending_emails: list[dict] = []
+    for input_signer, national_id in normalized:
+        result = await db.execute(
+            select(User).where(User.email == input_signer.email)
+        )
+        user = result.scalar_one_or_none()
+        user_was_created = user is None
+        if user and user.role != Role.SIGNER:
+            raise ValueError(
+                f"O e-mail {input_signer.email} já pertence a um usuário que não é signatário"
+            )
 
-    jti = str(uuid.uuid4())
-    token_expires_at = datetime.now(tz=timezone.utc) + timedelta(hours=48)
-    notification_jwt = create_notification_jwt(str(user.user_id), jti)
+        if not user:
+            user = User(
+                email=input_signer.email,
+                password_hash=None,
+                role=2  # SIGNER
+            )
+            db.add(user)
+            await db.flush()
 
-    db.add(NotificationToken(
-        jti=jti,
-        user_id=user.user_id,
-        expires_at=token_expires_at,
-    ))
+        result = await db.execute(
+            select(Signer)
+            .where(Signer.national_id == national_id)
+            .where(Signer.deleted_at.is_(None))
+            .order_by(Signer.signer_id.desc())
+        )
+        signer = result.scalars().first()
+        if signer and signer.user_id != user.user_id:
+            raise ValueError(
+                f"O CPF informado para {input_signer.full_name} já pertence a outro signatário"
+            )
+
+        if not signer:
+            signer = Signer(
+                full_name=input_signer.full_name,
+                phone_number=input_signer.phone_number,
+                contact_email=input_signer.email,
+                national_id=national_id,
+                photo_id_url=input_signer.photo_id_url,
+                user_id=user.user_id
+            )
+            db.add(signer)
+            await db.flush()
+
+        if signer.face_embedding is None:
+            if not input_signer.photo_id_url:
+                raise ValueError(
+                    f"Foto do signatário {input_signer.full_name} é obrigatória para biometria"
+                )
+            try:
+                embedding = extract_face_embedding_from_path(input_signer.photo_id_url)
+                signer.face_embedding = embedding.tolist()
+            except Exception as e:
+                raise ValueError(
+                    f"Erro ao gerar biometria facial de {input_signer.full_name}: {str(e)}"
+                )
+
+        db.add(DocumentSigner(
+            document_id=document.document_id,
+            signer_id=signer.signer_id,
+            status_id=1
+        ))
+
+        jti = str(uuid.uuid4())
+        token_expires_at = datetime.now(tz=timezone.utc) + timedelta(hours=48)
+        notification_jwt = create_notification_jwt(str(user.user_id), jti)
+        db.add(NotificationToken(
+            jti=jti,
+            user_id=user.user_id,
+            expires_at=token_expires_at,
+        ))
+
+        pending_emails.append({
+            "user_was_created": user_was_created,
+            "email": user.email,
+            "full_name": signer.full_name,
+            "token": notification_jwt,
+        })
 
     await db.commit()
     await db.refresh(document)
 
-    try:
-        if user_was_created:
-            activation_link = (
-                f"{settings.FRONTEND_BASE_URL}/auth/set-password?token={notification_jwt}"
+    for item in pending_emails:
+        try:
+            if item["user_was_created"]:
+                activation_link = (
+                    f"{settings.FRONTEND_BASE_URL}/auth/set-password?token={item['token']}"
+                )
+                send_set_password_email(
+                    to_email=item["email"],
+                    full_name=item["full_name"],
+                    reset_link=activation_link,
+                )
+            else:
+                documents_link = (
+                    f"{settings.FRONTEND_BASE_URL}/documents?token={item['token']}"
+                )
+                send_pending_document_email(
+                    to_email=item["email"],
+                    full_name=item["full_name"],
+                    document_name=document.file_name,
+                    documents_link=documents_link,
+                )
+        except Exception as exc:
+            _log.error(
+                "Documento %s criado mas e-mail falhou para %s: %s",
+                document.document_id,
+                item["email"],
+                exc,
             )
-            send_set_password_email(
-                to_email=user.email,
-                full_name=signer.full_name,
-                reset_link=activation_link,
-            )
-        else:
-            documents_link = (
-                f"{settings.FRONTEND_BASE_URL}/documents?token={notification_jwt}"
-            )
-            send_pending_document_email(
-                to_email=user.email,
-                full_name=signer.full_name,
-                document_name=document.file_name,
-                documents_link=documents_link,
-            )
-    except Exception as exc:
-        _log.error(
-            "Documento %s criado mas e-mail falhou para %s: %s",
-            document.document_id,
-            user.email,
-            exc,
-        )
 
     return document
 

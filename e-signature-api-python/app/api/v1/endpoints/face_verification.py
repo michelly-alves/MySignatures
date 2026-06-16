@@ -19,9 +19,10 @@ from app.api.v1.responses import err, _401, _500
 from app.services.face_recognition import (
     compare_embeddings,
     extract_face_embedding_from_path,
-    extract_face_embedding_from_bytes,
+    extract_face_embedding_and_yaw_from_bytes,
     extract_face_pose_from_bytes,
 )
+from app.utils.timing import log_duration
 
 router = APIRouter(prefix="/face-verification", tags=["Face Verification"])
 
@@ -40,13 +41,12 @@ def _decode_image(image_base64: str) -> bytes:
 
 
 def _validate_liveness_poses(
-    front_bytes: bytes,
+    front_yaw: float,
     left_bytes: bytes,
     right_bytes: bytes,
 ) -> tuple[bool, dict]:
 
     try:
-        front_yaw = extract_face_pose_from_bytes(front_bytes)
         left_yaw  = extract_face_pose_from_bytes(left_bytes)
         right_yaw = extract_face_pose_from_bytes(right_bytes)
 
@@ -184,17 +184,19 @@ async def verify_face(
         raise HTTPException(400, "Imagem inválida")
 
     try:
-        selfie_embedding = extract_face_embedding_from_path(
-            str(selfie_path)
-        )
+        with log_duration(logger, "Reconhecimento Facial (extração + comparação)", user_id=user_id):
+            selfie_embedding = extract_face_embedding_from_path(
+                str(selfie_path)
+            )
+            similarity = compare_embeddings(
+                stored_embedding=signer.face_embedding,
+                selfie_embedding=selfie_embedding,
+            )
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("Erro ao extrair embedding")
         raise HTTPException(400, "Rosto não detectado")
-
-    similarity = compare_embeddings(
-        stored_embedding=signer.face_embedding,
-        selfie_embedding=selfie_embedding,
-    )
 
     verified = similarity >= SIMILARITY_THRESHOLD
 
@@ -280,23 +282,25 @@ async def verify_document_liveness(
     left_bytes = _decode_image(frames["left"].image_base64)
     right_bytes = _decode_image(frames["right"].image_base64)
 
-    try:
-        selfie_embedding = extract_face_embedding_from_bytes(front_bytes)
-    except Exception:
-        logger.exception("Erro ao extrair embedding frontal")
-        raise HTTPException(400, "Rosto não detectado no frame frontal")
+    with log_duration(logger, "Prova de Vida (biometria + pose 3 frames)", document_id=document_id):
+        try:
+            # Frame frontal: embedding e yaw extraídos numa única inferência.
+            selfie_embedding, front_yaw = extract_face_embedding_and_yaw_from_bytes(front_bytes)
+        except Exception:
+            logger.exception("Erro ao extrair embedding frontal")
+            raise HTTPException(400, "Rosto não detectado no frame frontal")
 
-    similarity = compare_embeddings(
-        stored_embedding=signer.face_embedding,
-        selfie_embedding=selfie_embedding,
-    )
+        similarity = compare_embeddings(
+            stored_embedding=signer.face_embedding,
+            selfie_embedding=selfie_embedding,
+        )
 
-    face_valid = similarity >= SIMILARITY_THRESHOLD
-    movement_valid, movement_metrics = _validate_liveness_poses(
-        front_bytes=front_bytes,
-        left_bytes=left_bytes,
-        right_bytes=right_bytes,
-    )
+        face_valid = similarity >= SIMILARITY_THRESHOLD
+        movement_valid, movement_metrics = _validate_liveness_poses(
+            front_yaw=front_yaw,
+            left_bytes=left_bytes,
+            right_bytes=right_bytes,
+        )
     verified = face_valid and movement_valid
 
     if verified:

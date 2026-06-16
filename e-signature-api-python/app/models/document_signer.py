@@ -32,3 +32,11 @@ class DocumentSigner(Base):
 
     document = relationship("Document", lazy="joined")
     signer = relationship("Signer", lazy="joined")
+
+    @property
+    def signer_name(self) -> str | None:
+        return self.signer.full_name if self.signer else None
+
+    @property
+    def signer_email(self) -> str | None:
+        return self.signer.contact_email if self.signer else None

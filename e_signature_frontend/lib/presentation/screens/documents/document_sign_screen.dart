@@ -5,9 +5,11 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:e_signature_frontend/core/constants/api_constants.dart';
+import 'package:e_signature_frontend/core/utils/session_manager.dart';
 import 'package:e_signature_frontend/data/models/document_model.dart';
 import 'package:e_signature_frontend/data/repositories/auth_repository.dart';
 import 'package:e_signature_frontend/data/services/crypto/document_crypto_signer.dart';
+import 'package:e_signature_frontend/presentation/screens/documents/facial_recognition_screen.dart';
 import 'package:e_signature_frontend/presentation/widgets/pdf_preview/pdf_preview.dart';
 import 'package:e_signature_frontend/theme/app_colors.dart';
 import 'package:flutter/material.dart';
@@ -63,6 +65,8 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
         Uri.parse('${ApiConstants.baseUrl}/api/me'),
         headers: {'Authorization': 'Bearer $token'},
       );
+      if (SessionManager.isUnauthorized(response.statusCode)) return;
+
       if (response.statusCode == 200 && mounted) {
         final data = jsonDecode(response.body) as Map<String, dynamic>;
         setState(() => _hasRegisteredKey = data['has_signing_key'] == true);
@@ -82,6 +86,9 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
       headers: {'Authorization': 'Bearer $token'},
     );
 
+    if (SessionManager.isUnauthorized(response.statusCode)) {
+      throw Exception('Sessão expirada. Faça login novamente.');
+    }
     if (response.statusCode == 200) return response.bodyBytes;
     if (response.statusCode == 403) throw Exception('Sem permissão para visualizar este documento.');
     if (response.statusCode == 404) throw Exception('Arquivo do documento não encontrado.');
@@ -96,6 +103,9 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
       Uri.parse('${ApiConstants.baseUrl}/documents/${widget.document.documentId}'),
       headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer $token'},
     );
+    if (SessionManager.isUnauthorized(response.statusCode)) {
+      throw Exception('Sessão expirada. Faça login novamente.');
+    }
     if (response.statusCode != 200) throw Exception('Hash do documento indisponível.');
 
     final data = jsonDecode(response.body);
@@ -226,8 +236,11 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
                         onPressed: downloading
                             ? null
                             : () async {
-                                final pass    = passwordCtrl.text.trim();
-                                final confirm = confirmCtrl.text.trim();
+                                // Senha usada SEM trim, idêntica ao fluxo de
+                                // assinatura (_showSignDialog), para que a
+                                // derivação PBKDF2 seja sempre consistente.
+                                final pass    = passwordCtrl.text;
+                                final confirm = confirmCtrl.text;
                                 if (pass.length < 8) {
                                   setLocal(() => error = 'Senha deve ter pelo menos 8 caracteres.');
                                   return;
@@ -406,7 +419,27 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
                     Text(error!, style: GoogleFonts.poppins(color: Colors.red, fontSize: 12)),
                   ],
 
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton(
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        _rotateKey();
+                      },
+                      style: TextButton.styleFrom(padding: EdgeInsets.zero),
+                      child: Text(
+                        'Perdi minha chave de assinatura',
+                        style: GoogleFonts.poppins(
+                          fontSize: 12,
+                          color: AppColors.primaryButton,
+                          decoration: TextDecoration.underline,
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 12),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
@@ -440,6 +473,191 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
     );
     _pdfPointerEnabled.value = true;
     return result;
+  }
+
+  /// Fluxo de rotação de chave (perda do .ekey/senha): captura selfie para
+  /// re-verificação facial no servidor, gera um novo par de chaves e
+  /// substitui a âncora de identidade.
+  Future<void> _rotateKey() async {
+    final image = await Navigator.of(context).push<String>(
+      MaterialPageRoute(
+        builder: (_) => const FacialRecognitionScreen(
+          userId: '',
+          captureOnly: true,
+        ),
+      ),
+    );
+    if (image == null || !mounted) return;
+
+    await _showKeyRotationDialog(image);
+  }
+
+  Future<void> _showKeyRotationDialog(String liveImageBase64) async {
+    final passwordCtrl = TextEditingController();
+    final confirmCtrl = TextEditingController();
+    bool processing = false;
+    bool done = false;
+    String? error;
+
+    _pdfPointerEnabled.value = false;
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => Dialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Rotacionar Chave de Assinatura',
+                      style: GoogleFonts.poppins(
+                          fontSize: 17, fontWeight: FontWeight.bold, color: AppColors.primaryText)),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Sua identidade foi verificada por reconhecimento facial. '
+                    'Crie uma senha para a NOVA chave. A chave anterior será '
+                    'revogada — assinaturas já feitas continuam válidas.',
+                    style: GoogleFonts.poppins(fontSize: 13, color: Colors.grey.shade700),
+                  ),
+                  const SizedBox(height: 20),
+                  if (!done) ...[
+                    TextField(
+                      controller: passwordCtrl,
+                      obscureText: true,
+                      decoration: InputDecoration(
+                        labelText: 'Nova senha da chave',
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: confirmCtrl,
+                      obscureText: true,
+                      decoration: InputDecoration(
+                        labelText: 'Confirmar nova senha',
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                    ),
+                    if (error != null) ...[
+                      const SizedBox(height: 8),
+                      Text(error!, style: GoogleFonts.poppins(color: Colors.red, fontSize: 12)),
+                    ],
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        icon: processing
+                            ? const SizedBox(
+                                width: 16, height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                            : const Icon(Icons.autorenew),
+                        label: Text(processing ? 'Rotacionando...' : 'Gerar nova chave',
+                            style: GoogleFonts.poppins(fontWeight: FontWeight.w600)),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primaryButton,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        onPressed: processing
+                            ? null
+                            : () async {
+                                final pass = passwordCtrl.text;
+                                final confirm = confirmCtrl.text;
+                                if (pass.length < 8) {
+                                  setLocal(() => error = 'Senha deve ter pelo menos 8 caracteres.');
+                                  return;
+                                }
+                                if (pass != confirm) {
+                                  setLocal(() => error = 'As senhas não coincidem.');
+                                  return;
+                                }
+                                setLocal(() { processing = true; error = null; });
+                                try {
+                                  final keyResult = await DocumentCryptoSigner()
+                                      .generateAndEncryptKeyPair(pass);
+
+                                  final rotation = await _authRepository.rotateSigningKey(
+                                    keyResult.publicKeyPem,
+                                    liveImageBase64,
+                                  );
+                                  if (!rotation.ok) {
+                                    throw Exception(
+                                        rotation.error ?? 'Falha ao rotacionar a chave.');
+                                  }
+
+                                  _downloadFile(
+                                    keyResult.encryptedKeyFile,
+                                    'chave-assinatura-${widget.document.documentId}.ekey',
+                                  );
+                                  setLocal(() { done = true; processing = false; });
+                                } catch (e) {
+                                  setLocal(() {
+                                    error = e.toString().replaceFirst('Exception: ', '');
+                                    processing = false;
+                                  });
+                                }
+                              },
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Center(
+                      child: TextButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        child: Text('Cancelar', style: GoogleFonts.poppins(color: Colors.grey)),
+                      ),
+                    ),
+                  ] else ...[
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.green.withValues(alpha: 0.08),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.green.withValues(alpha: 0.3)),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.check_circle_outline, color: Colors.green, size: 20),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'Nova chave gerada e registrada. O novo arquivo .ekey '
+                              'foi baixado — guarde-o com segurança.',
+                              style: GoogleFonts.poppins(fontSize: 13, color: Colors.green.shade800),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton(
+                        onPressed: () => Navigator.pop(ctx),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primaryButton,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        child: Text('Concluir',
+                            style: GoogleFonts.poppins(fontWeight: FontWeight.w600)),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    _pdfPointerEnabled.value = true;
   }
 
   Future<void> _signDocument() async {
@@ -483,6 +701,8 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
       );
 
       if (!mounted) return;
+
+      if (SessionManager.isUnauthorized(response.statusCode)) return;
 
       if (response.statusCode == 201) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(

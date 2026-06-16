@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/constants/api_constants.dart';
+import '../../core/utils/session_manager.dart';
 import '../models/document_signer_model.dart';
 
 class DocumentSignerRepository {
@@ -33,6 +34,8 @@ class DocumentSignerRepository {
           'Authorization': 'Bearer $token',
         },
       );
+
+      SessionManager.isUnauthorized(response.statusCode);
 
       if (response.statusCode == 200) {
         final List<dynamic> data = jsonDecode(response.body);

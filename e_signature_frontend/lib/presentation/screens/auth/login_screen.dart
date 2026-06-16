@@ -19,6 +19,7 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final TextEditingController _emailController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
+  final Map<TextEditingController, bool> _obscure = {};
   bool _isLoading = false;
 
   @override
@@ -274,9 +275,10 @@ class _LoginScreenState extends State<LoginScreen> {
     String? hint,
     TextInputType? keyboardType,
   }) {
+    final obscure = _obscure[controller] ?? true;
     return TextFormField(
       controller: controller,
-      obscureText: isPassword,
+      obscureText: isPassword && obscure,
       keyboardType: keyboardType,
       style: GoogleFonts.poppins(),
       decoration: InputDecoration(
@@ -284,6 +286,18 @@ class _LoginScreenState extends State<LoginScreen> {
         hintStyle: GoogleFonts.poppins(color: Colors.grey[400], fontSize: 14),
         filled: true,
         fillColor: Colors.white,
+        suffixIcon: isPassword
+            ? IconButton(
+                icon: Icon(
+                  obscure
+                      ? Icons.visibility_outlined
+                      : Icons.visibility_off_outlined,
+                  color: Colors.grey,
+                ),
+                onPressed: () =>
+                    setState(() => _obscure[controller] = !obscure),
+              )
+            : null,
         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(12),

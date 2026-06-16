@@ -14,13 +14,14 @@ import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from pathlib import Path
 import hashlib
+import json
 import re
 import uuid
 
 from sqlalchemy import select
 from app.db import get_db
 from app.utils.timing import log_duration
-from app.schemas.document import CreateDocument, UpdateDocument
+from app.schemas.document import CreateDocument, UpdateDocument, SignerInput
 from app.services import document_service
 from app.services.signature_service import get_latest_signature_for_document
 from app.security.roles import require_roles
@@ -46,73 +47,62 @@ def _strip_optional(value: str | None) -> str | None:
     return value or None
 
 
-def _validate_required_document_fields(
-    company_id: int,
-    status_id: int,
-    signer_full_name: str | None,
-    signer_phone_number: str | None,
-    signer_email: str | None,
-    signer_national_id: str | None,
-):
-    missing = []
-
-    if not company_id or company_id <= 0:
-        missing.append("company_id")
-    if not status_id or status_id <= 0:
-        missing.append("status_id")
-    if not signer_full_name:
-        missing.append("signer_full_name")
-    if not signer_phone_number:
-        missing.append("signer_phone_number")
-    if not signer_email:
-        missing.append("signer_email")
-    if not signer_national_id:
-        missing.append("signer_national_id")
-
-    if missing:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Campos obrigatórios para criação do documento: {', '.join(missing)}"
-        )
-
-    national_id_digits = re.sub(r"\D", "", signer_national_id)
-    if len(national_id_digits) != 11:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="CPF do signatário inválido: informe 11 dígitos em signer_national_id."
-        )
-
-    phone_digits = re.sub(r"\D", "", signer_phone_number)
-    if len(phone_digits) < 10 or len(phone_digits) > 13:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Telefone do signatário inválido: informe DDD e número em signer_phone_number."
-        )
-
-
-def _validate_upload_metadata(
-    document_file: UploadFile,
-    signer_photo_id_file: UploadFile,
-):
+def _validate_document_file(document_file: UploadFile):
     if not document_file.filename:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Arquivo do documento é obrigatório."
-        )
-    if not signer_photo_id_file.filename:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Foto do documento/selfie do signatário é obrigatória."
         )
     if document_file.content_type != "application/pdf":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Arquivo do documento deve ser um PDF."
         )
-    if signer_photo_id_file.content_type not in ALLOWED_PHOTO_CONTENT_TYPES:
+
+
+def _validate_photo_file(photo_file: UploadFile, signer_name: str):
+    if not photo_file.filename:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Foto do signatário deve ser JPG, PNG ou WEBP."
+            detail=f"Foto do signatário {signer_name} é obrigatória."
+        )
+    if photo_file.content_type not in ALLOWED_PHOTO_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Foto do signatário {signer_name} deve ser JPG, PNG ou WEBP."
+        )
+
+
+def _validate_signer_payload(signer: dict):
+    missing = [
+        field for field in ("full_name", "phone_number", "email", "national_id")
+        if not str(signer.get(field) or "").strip()
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Campos obrigatórios do signatário: {', '.join(missing)}"
+        )
+
+    email = str(signer["email"]).strip()
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"E-mail inválido para {signer['full_name']}."
+        )
+
+    national_id_digits = re.sub(r"\D", "", str(signer["national_id"]))
+    if len(national_id_digits) != 11:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"CPF inválido para {signer['full_name']}: informe 11 dígitos."
+        )
+
+    phone_digits = re.sub(r"\D", "", str(signer["phone_number"]))
+    if len(phone_digits) < 10 or len(phone_digits) > 13:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Telefone inválido para {signer['full_name']}: informe DDD e número."
         )
 
 
@@ -137,7 +127,7 @@ async def _read_upload_with_limit(
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, responses=(
-    err(400, "Dados inválidos", "Campos obrigatórios para criação do documento: signer_full_name, signer_email.") |
+    err(400, "Dados inválidos", "Campos obrigatórios do signatário: full_name, email.") |
     _401 |
     err(403, "Sem permissão", "Você não tem permissão para criar documentos.") |
     err(404, "Empresa não encontrada", "Empresa informada não foi encontrada.") |
@@ -149,38 +139,41 @@ async def _read_upload_with_limit(
 async def create_document(
     current_user: User = Depends(get_current_user),
     company_id: int = Form(...),
-    status_id: int = Form(2),
-
-    signer_full_name: str | None = Form(None),
-    signer_phone_number: str | None = Form(None),
-    signer_email: str | None = Form(None),
-    signer_national_id: str | None = Form(None),
-
+    signers: str = Form(
+        ...,
+        description='Lista JSON de signatários: [{"full_name","phone_number","email","national_id"}]',
+    ),
     document_file: UploadFile = File(...),
-    signer_photo_id_file: UploadFile = File(...),
-
+    signer_photos: list[UploadFile] = File(...),
     db: AsyncSession = Depends(get_db)
 ):
-    signer_full_name = _strip_optional(signer_full_name)
-    signer_phone_number = _strip_optional(signer_phone_number)
-    signer_email = _strip_optional(signer_email)
-    signer_national_id = _strip_optional(signer_national_id)
-
-    _validate_required_document_fields(
-        company_id=company_id,
-        status_id=status_id,
-        signer_full_name=signer_full_name,
-        signer_phone_number=signer_phone_number,
-        signer_email=signer_email,
-        signer_national_id=signer_national_id,
-    )
-    _validate_upload_metadata(document_file, signer_photo_id_file)
-
     if current_user.role not in (Role.ADMIN, Role.COMPANY):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Você não tem permissão para criar documentos."
         )
+
+    try:
+        signers_data = json.loads(signers)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campo 'signers' deve ser um JSON válido."
+        )
+    if not isinstance(signers_data, list) or not signers_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Informe ao menos um signatário em 'signers'."
+        )
+    if len(signer_photos) != len(signers_data):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Envie uma foto para cada signatário, na mesma ordem da lista."
+        )
+
+    _validate_document_file(document_file)
+    for signer in signers_data:
+        _validate_signer_payload(signer)
 
     if current_user.role == Role.COMPANY:
         result = await db.execute(
@@ -190,8 +183,7 @@ async def create_document(
                 Company.deleted_at.is_(None),
             )
         )
-        company = result.scalar_one_or_none()
-        if not company:
+        if result.scalar_one_or_none() is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Empresa informada não pertence ao usuário autenticado."
@@ -204,8 +196,7 @@ async def create_document(
                 Company.deleted_at.is_(None),
             )
         )
-        company = result.scalar_one_or_none()
-        if not company:
+        if result.scalar_one_or_none() is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Empresa informada não foi encontrada."
@@ -223,39 +214,46 @@ async def create_document(
             "document_file"
         )
 
-    photo_filename = f"{uuid.uuid4()}-{signer_photo_id_file.filename}"
-    photo_path = upload_dir / photo_filename
-    photo_bytes = await _read_upload_with_limit(
-        signer_photo_id_file,
-        MAX_PHOTO_FILE_SIZE,
-        "signer_photo_id_file"
-    )
-
     with log_duration(logger, "Cálculo do Hash do Documento", file_name=document_file.filename, size_bytes=len(doc_bytes)):
         hash_sha256 = hashlib.sha256(doc_bytes).hexdigest()
-    signer_national_id = re.sub(r"\D", "", signer_national_id)
-    status_id = DOCUMENT_STATUS_IN_PROGRESS
+
+    # Uma foto por signatário (mesma ordem da lista), gravadas só após validar.
+    signer_inputs: list[SignerInput] = []
+    photos_to_write: list[tuple[Path, bytes]] = []
+    for signer, photo in zip(signers_data, signer_photos):
+        _validate_photo_file(photo, str(signer["full_name"]))
+        photo_bytes = await _read_upload_with_limit(
+            photo,
+            MAX_PHOTO_FILE_SIZE,
+            f"foto de {signer['full_name']}"
+        )
+        photo_path = upload_dir / f"{uuid.uuid4()}-{photo.filename}"
+        photos_to_write.append((photo_path, photo_bytes))
+        signer_inputs.append(SignerInput(
+            full_name=str(signer["full_name"]).strip(),
+            phone_number=str(signer["phone_number"]).strip(),
+            email=str(signer["email"]).strip(),
+            national_id=re.sub(r"\D", "", str(signer["national_id"])),
+            photo_id_url=str(photo_path),
+        ))
 
     create_request = CreateDocument(
         company_id=company_id,
-        status_id=status_id,
-        signer_full_name=signer_full_name,
-        signer_phone_number=signer_phone_number,
-        signer_email=signer_email,
-        signer_national_id=signer_national_id,
+        status_id=DOCUMENT_STATUS_IN_PROGRESS,
         file_name=document_file.filename,
         file_path=str(doc_path),
         hash_sha256=hash_sha256,
-        photo_id_url=str(photo_path)
+        signers=signer_inputs,
     )
 
     try:
         with log_duration(logger, "Upload de PDF (gravação em disco)", path=str(doc_path)):
             doc_path.write_bytes(doc_bytes)
-        photo_path.write_bytes(photo_bytes)
+        for photo_path, photo_bytes in photos_to_write:
+            photo_path.write_bytes(photo_bytes)
 
         document = await asyncio.wait_for(
-            document_service.create_document_and_signer(db, create_request),
+            document_service.create_document_with_signers(db, create_request),
             timeout=TIMEOUT_SECONDS
         )
         return document

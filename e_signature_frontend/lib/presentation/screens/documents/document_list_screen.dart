@@ -8,6 +8,7 @@ import '../../../data/models/document_signature_summary_model.dart';
 import '../../providers/auth_provider.dart';
 import '../../../theme/app_colors.dart';
 import '../../widgets/document_status_badge.dart';
+import '../../widgets/signers_progress.dart';
 import 'document_sign_screen.dart';
 
 class DocumentsListScreen extends StatefulWidget {
@@ -279,6 +280,8 @@ class _DocumentsListScreenState extends State<DocumentsListScreen> {
                       Icon(Icons.visibility_outlined, color: Colors.grey.shade600, size: 20),
                     ],
                   ),
+                  if (doc.statusId == 2 || doc.statusId == 3)
+                    SignersProgress(documentId: doc.documentId),
                   _buildSignatureSummary(doc),
                 ],
               ),

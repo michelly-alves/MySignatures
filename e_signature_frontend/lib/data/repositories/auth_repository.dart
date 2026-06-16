@@ -5,6 +5,7 @@ import 'dart:convert';
 import 'dart:developer';
 
 import '../../core/constants/api_constants.dart';
+import '../../core/utils/session_manager.dart';
 
 class AuthRepository {
   final String _baseUrl = ApiConstants.baseUrl;
@@ -75,6 +76,8 @@ class AuthRepository {
       },
     );
 
+    if (SessionManager.isUnauthorized(response.statusCode)) return false;
+
     if (response.statusCode == 200) {
       return true;
     }
@@ -108,6 +111,8 @@ class AuthRepository {
         },
         body: json.encode({'live_image_base64': imageBase64}),
       );
+
+      if (SessionManager.isUnauthorized(response.statusCode)) return false;
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body);
@@ -144,6 +149,8 @@ class AuthRepository {
             .toList(),
       }),
     );
+
+    if (SessionManager.isUnauthorized(response.statusCode)) return false;
 
     if (response.statusCode != 200) {
       log('Falha na prova de vida: ${response.statusCode} ${response.body}');
@@ -206,7 +213,82 @@ class AuthRepository {
       body: jsonEncode({'public_key_pem': publicKeyPem}),
     );
 
+    if (SessionManager.isUnauthorized(response.statusCode)) return false;
+
     return response.statusCode == 200;
+  }
+
+  Future<({bool ok, String? error})> rotateSigningKey(
+    String newPublicKeyPem,
+    String liveImageBase64,
+  ) async {
+    final token = await getToken();
+    if (token == null) return (ok: false, error: 'Sessão expirada.');
+
+    final response = await http.post(
+      Uri.parse('$_baseUrl/api/signer/rotate-key'),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $token',
+      },
+      body: jsonEncode({
+        'new_public_key_pem': newPublicKeyPem,
+        'live_image_base64': liveImageBase64,
+      }),
+    );
+
+    if (SessionManager.isUnauthorized(response.statusCode)) {
+      return (ok: false, error: 'Sessão expirada. Faça login novamente.');
+    }
+
+    if (response.statusCode == 200) return (ok: true, error: null);
+
+    String msg = 'Falha ao rotacionar a chave (código ${response.statusCode}).';
+    try {
+      final data = jsonDecode(response.body);
+      if (data is Map && data['detail'] != null) msg = data['detail'].toString();
+    } catch (_) {}
+    return (ok: false, error: msg);
+  }
+
+  Future<({bool ok, String? error})> changePassword({
+    required String currentPassword,
+    required String newPassword,
+  }) async {
+    final token = await getToken();
+    if (token == null) return (ok: false, error: 'Sessão expirada.');
+
+    final response = await http.post(
+      Uri.parse('$_baseUrl/auth/change-password'),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer $token',
+      },
+      body: jsonEncode({
+        'current_password': currentPassword,
+        'new_password': newPassword,
+      }),
+    );
+
+    if (SessionManager.isUnauthorized(response.statusCode)) {
+      return (ok: false, error: 'Sessão expirada. Faça login novamente.');
+    }
+
+    if (response.statusCode == 200) return (ok: true, error: null);
+
+    String msg = 'Falha ao alterar a senha (código ${response.statusCode}).';
+    try {
+      final data = jsonDecode(response.body);
+      final detail = data is Map ? data['detail'] : null;
+      if (detail is String) {
+        msg = detail;
+      } else if (detail is List && detail.isNotEmpty && detail.first is Map) {
+        msg = (detail.first['msg'] ?? msg)
+            .toString()
+            .replaceFirst('Value error, ', '');
+      }
+    } catch (_) {}
+    return (ok: false, error: msg);
   }
 
   Future<bool> updateUser(int userId, Map<String, dynamic> data) async {
@@ -221,6 +303,8 @@ class AuthRepository {
     },
     body: jsonEncode(data),
   );
+
+  if (SessionManager.isUnauthorized(response.statusCode)) return false;
 
   return response.statusCode == 200;
 }
