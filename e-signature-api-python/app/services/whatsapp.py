@@ -3,6 +3,7 @@ import re
 import httpx
 
 from app.core.config import settings
+from app.utils.timing import log_duration
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +87,16 @@ async def send_otp_via_whatsapp(to_number: str, otp_code: str) -> str:
         )
 
     try:
+        # Mede SOMENTE o envio do OTP à Twilio (a chamada HTTP retorna quando a
+        # Twilio aceita/enfileira a mensagem). A entrega final via WhatsApp é
+        # assíncrona, de responsabilidade de terceiros, e NÃO entra nesta conta.
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.post(
-                url,
-                data=data,
-                auth=(account_sid, auth_token),
-            )
+            with log_duration(logger, "Envio do OTP para a Twilio", to=to_formatted):
+                response = await client.post(
+                    url,
+                    data=data,
+                    auth=(account_sid, auth_token),
+                )
     except httpx.TimeoutException:
         raise RuntimeError("Timeout ao conectar com o serviço Twilio")
     except httpx.RequestError as e:

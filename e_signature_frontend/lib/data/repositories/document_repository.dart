@@ -102,10 +102,18 @@ class DocumentRepository {
         ],
       });
 
+      // Cronometra o upload do PDF: do disparo do POST até o cliente receber
+      // a resposta (201) — round-trip real percebido pelo usuário no upload.
+      final uploadSw = Stopwatch()..start();
       final response = await dio.post(
         '$_baseUrl/documents',
         data: formData,
         options: Options(headers: {'Authorization': 'Bearer $token'}),
+      );
+      uploadSw.stop();
+      debugPrint(
+        '[TEMPO] Upload do PDF (round-trip: POST /documents até status '
+        '${response.statusCode}) levou ${uploadSw.elapsedMilliseconds} ms',
       );
 
       return response.statusCode == 201 ? null : 'Erro ao criar documento. Código: ${response.statusCode}';

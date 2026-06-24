@@ -252,11 +252,18 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
                                 setLocal(() { downloading = true; error = null; });
 
                                 try {
+                                  final gerarChaveSw = Stopwatch()..start();
                                   final result = await DocumentCryptoSigner()
                                       .generateAndEncryptKeyPair(pass);
 
                                   final ok = await _authRepository
                                       .registerSigningKey(result.publicKeyPem);
+                                  gerarChaveSw.stop();
+                                  debugPrint(
+                                    '[TEMPO] Gerar Chave (real: geração RSA + '
+                                    'registro no servidor até sucesso=$ok) levou '
+                                    '${gerarChaveSw.elapsedMilliseconds} ms',
+                                  );
                                   if (!ok) throw Exception('Falha ao registrar chave no servidor.');
 
                                   _downloadFile(
@@ -579,12 +586,19 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
                                 }
                                 setLocal(() { processing = true; error = null; });
                                 try {
+                                  final rotacaoSw = Stopwatch()..start();
                                   final keyResult = await DocumentCryptoSigner()
                                       .generateAndEncryptKeyPair(pass);
 
                                   final rotation = await _authRepository.rotateSigningKey(
                                     keyResult.publicKeyPem,
                                     liveImageBase64,
+                                  );
+                                  rotacaoSw.stop();
+                                  debugPrint(
+                                    '[TEMPO] Gerar Chave (rotação real: geração RSA + '
+                                    'rotação no servidor) levou '
+                                    '${rotacaoSw.elapsedMilliseconds} ms',
                                   );
                                   if (!rotation.ok) {
                                     throw Exception(
@@ -682,12 +696,18 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
 
       final documentHash = await _resolveDocumentHash(token);
 
+      // Tempo total percebido pelo usuário ao confirmar a assinatura:
+      // assinatura criptográfica do hash + round-trip ao servidor (acumulador
+      // RSA + selagem do PDF). É o "valor real no sistema", não só o cripto.
+      final assinaturaTotalSw = Stopwatch()..start();
+
       final signature = await DocumentCryptoSigner().signDocumentHash(
         documentHash,
         signInput.keyFile,
         signInput.password,
       );
 
+      final registroSw = Stopwatch()..start();
       final response = await http.post(
         Uri.parse('${ApiConstants.baseUrl}/documents/${widget.document.documentId}/sign'),
         headers: {
@@ -698,6 +718,18 @@ class _DocumentSignScreenState extends State<DocumentSignScreen> {
           'signature_base64': signature.signatureBase64,
           'public_key_pem': signature.publicKeyPem,
         }),
+      );
+      registroSw.stop();
+      assinaturaTotalSw.stop();
+      debugPrint(
+        '[TEMPO] Registro da Assinatura no servidor (round-trip: acumulador + '
+        'selagem do PDF até status ${response.statusCode}) levou '
+        '${registroSw.elapsedMilliseconds} ms',
+      );
+      debugPrint(
+        '[TEMPO] Assinar o PDF (real: assinar hash + registrar no servidor até '
+        'status ${response.statusCode}) levou '
+        '${assinaturaTotalSw.elapsedMilliseconds} ms',
       );
 
       if (!mounted) return;

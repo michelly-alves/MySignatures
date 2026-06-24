@@ -3,7 +3,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.accumulator import (
@@ -14,7 +14,7 @@ from app.models.accumulator import (
     Witness,
 )
 from app.services.rsa_accumulator_adapter import rsa_accumulator_adapter
-from app.utils.timing import accumulate_duration
+from app.utils.timing import accumulate_duration, log_duration
 
 
 logger = logging.getLogger(__name__)
@@ -203,6 +203,128 @@ async def get_witness_on_demand(
         select(AccumulatorElement).where(AccumulatorElement.element_id == element_id)
     )
     element = element_result.scalars().first()
+
+    return {
+        "element_id": element_id,
+        "state_id": state.state_id,
+        "state_value_hex": state.state_value_hex,
+        "state_sha256": state_fingerprint(state.state_value_hex),
+        "modulus_n_hex": state.modulus_n_hex,
+        "x_hex": element.x_value_hex,
+        "x_nonce": element.x_nonce,
+        "witness_hex": witness.witness_value_hex,
+        "valid": witness.is_valid,
+    }
+
+
+async def get_single_witness_on_demand(
+    db: AsyncSession,
+    element_id: int,
+    state_id: int | None = None,
+) -> dict | None:
+    """
+    Testemunha de pertencimento de UM elemento contra um estado, calculada
+    isoladamente: ``w = g^(produto dos demais x) mod N``.
+
+    É o caminho pericial endurecido: ao contrário de
+    ``materialize_witnesses_for_state`` (lote RootFactor, O(n log n) e até n
+    inserções), aqui a perícia pede a prova de UMA assinatura, então o custo é
+    uma única exponenciação modular e UMA linha inserida — eliminando o vetor
+    de amplificação (O(n²) de armazenamento) do endpoint sob demanda.
+
+    Memoizado: se a testemunha (element, state) já existir, retorna do banco.
+    Retorna None se o estado/elemento não existe ou se o elemento ainda não
+    havia sido incorporado até o estado solicitado.
+    """
+    if state_id is None:
+        state = await get_latest_state(db)
+    else:
+        result = await db.execute(
+            select(AccumulatorState).where(AccumulatorState.state_id == state_id)
+        )
+        state = result.scalars().first()
+    if not state:
+        return None
+
+    element_result = await db.execute(
+        select(AccumulatorElement).where(AccumulatorElement.element_id == element_id)
+    )
+    element = element_result.scalars().first()
+    if element is None:
+        return None
+
+    incorporated = await db.scalar(
+        select(func.count())
+        .select_from(AccumulatorElementState)
+        .where(
+            AccumulatorElementState.element_id == element_id,
+            AccumulatorElementState.state_id <= state.state_id,
+        )
+    )
+    if not incorporated:
+        return None
+
+    existing = await db.execute(
+        select(Witness).where(
+            Witness.element_id == element_id,
+            Witness.state_id == state.state_id,
+        )
+    )
+    witness = existing.scalars().first()
+
+    if witness is not None:
+        logger.info(
+            "[TEMPO] Testemunha sob Demanda servida do cache (memoizada, ~0 ms) "
+            "| element_id=%s | state_id=%s",
+            element_id,
+            state.state_id,
+        )
+    else:
+        generator = _from_hex(state.generator_hex)
+        modulus_n = _from_hex(state.modulus_n_hex)
+        state_value = _from_hex(state.state_value_hex)
+        x_target = _from_hex(element.x_value_hex)
+
+        others = await db.execute(
+            select(AccumulatorElement.x_value_hex)
+            .join(
+                AccumulatorElementState,
+                AccumulatorElementState.element_id == AccumulatorElement.element_id,
+            )
+            .where(
+                AccumulatorElementState.state_id <= state.state_id,
+                AccumulatorElement.element_id != element_id,
+            )
+        )
+        other_x_values = [_from_hex(value) for value in others.scalars().all()]
+
+        def _compute() -> tuple[int, bool]:
+            exponent = 1
+            for value in other_x_values:
+                exponent *= value
+            witness_value = pow(generator, exponent, modulus_n)
+            is_valid = pow(witness_value, x_target, modulus_n) == state_value
+            return witness_value, is_valid
+
+        # Mede SÓ a geração da testemunha (witness = g^(produto dos demais x)
+        # mod N): a parte cara e O(n) do endpoint /accumulator/witness.
+        with log_duration(
+            logger,
+            "Geração de Testemunha sob Demanda (witness = g^(prod x_i) mod n)",
+            element_id=element_id,
+            state_id=state.state_id,
+            n_outros=len(other_x_values),
+        ):
+            witness_value, is_valid = await asyncio.to_thread(_compute)
+
+        witness = Witness(
+            element_id=element_id,
+            state_id=state.state_id,
+            witness_value_hex=_to_hex(witness_value),
+            is_valid=is_valid,
+        )
+        db.add(witness)
+        await db.flush()
 
     return {
         "element_id": element_id,

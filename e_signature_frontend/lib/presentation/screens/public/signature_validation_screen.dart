@@ -54,9 +54,16 @@ class _SignatureValidationScreenState extends State<SignatureValidationScreen> {
     });
 
     try {
+      final validacaoSw = Stopwatch()..start();
       final response = await http.get(
         Uri.parse('${ApiConstants.baseUrl}/public/signatures/$code'),
         headers: {'Content-Type': 'application/json'},
+      );
+      validacaoSw.stop();
+      debugPrint(
+        '[TEMPO] Validar Assinatura (round-trip: verificação RSA + '
+        'pertencimento ao acumulador) levou '
+        '${validacaoSw.elapsedMilliseconds} ms',
       );
 
       if (!mounted) return;
@@ -837,8 +844,15 @@ class _IntegrityCheckDialogState extends State<_IntegrityCheckDialog> {
         filename: _fileName ?? 'documento.pdf',
       ));
 
+      final integridadeSw = Stopwatch()..start();
       final streamed = await request.send();
       final response = await http.Response.fromStream(streamed);
+      integridadeSw.stop();
+      debugPrint(
+        '[TEMPO] Verificar Integridade do PDF (round-trip: POST '
+        '/public/signatures/$code/verify-integrity até status '
+        '${response.statusCode}) levou ${integridadeSw.elapsedMilliseconds} ms',
+      );
       if (!mounted) return;
 
       if (response.statusCode == 200) {

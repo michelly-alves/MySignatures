@@ -175,7 +175,7 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
         );
         livenessSw.stop();
         debugPrint(
-          '[TEMPO] Prova de Vida (round-trip) levou '
+          '[TEMPO] Prova de Vida (round-trip até sucesso=$success) levou '
           '${livenessSw.elapsedMilliseconds} ms',
         );
 
@@ -196,7 +196,7 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
           await _authRepository.verifyFace(base64Image, widget.userId);
       faceSw.stop();
       debugPrint(
-        '[TEMPO] Reconhecimento Facial (round-trip) levou '
+        '[TEMPO] Reconhecimento Facial (round-trip até sucesso=$success) levou '
         '${faceSw.elapsedMilliseconds} ms',
       );
 

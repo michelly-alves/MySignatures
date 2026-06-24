@@ -427,12 +427,18 @@ async def get_signature_proof_by_validation_code(db: AsyncSession, validation_co
         return None
 
     signature, element, state, witness, signer, document = row
-    witness_valid = verify_membership(
-        witness_hex=witness.witness_value_hex,
-        x_value_hex=element.x_value_hex,
-        state_value_hex=state.state_value_hex,
-        modulus_n_hex=state.modulus_n_hex,
-    )
+    with log_duration(
+        logger,
+        "Verificação de Pertencimento no Acumulador (witness^x mod n)",
+        validation_code=validation_code,
+        state_id=state.state_id,
+    ):
+        witness_valid = verify_membership(
+            witness_hex=witness.witness_value_hex,
+            x_value_hex=element.x_value_hex,
+            state_value_hex=state.state_value_hex,
+            modulus_n_hex=state.modulus_n_hex,
+        )
 
     return {
         "signature": signature,

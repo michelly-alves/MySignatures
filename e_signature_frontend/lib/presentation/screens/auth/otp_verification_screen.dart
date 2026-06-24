@@ -57,6 +57,11 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
         ? widget.email
         : Provider.of<AuthProvider>(context, listen: false).userEmail ?? '';
 
+    // Round-trip da solicitação do código (rede + geração no servidor +
+    // enfileiramento na Twilio). NÃO inclui a entrega via WhatsApp (terceiro):
+    // o tempo isolado do envio à Twilio é medido no backend
+    // ("[TEMPO] Envio do OTP para a Twilio").
+    final otpSw = Stopwatch()..start();
     if (phoneNumber != null && phoneNumber.isNotEmpty) {
       final response = await http.post(
         Uri.parse("${ApiConstants.baseUrl}/otp/generate"),
@@ -71,6 +76,11 @@ class _OtpVerificationScreenState extends State<OtpVerificationScreen> {
       final authProvider = Provider.of<AuthProvider>(context, listen: false);
       sent = await authProvider.generateOtpForCurrentUser();
     }
+    otpSw.stop();
+    debugPrint(
+      '[TEMPO] Geração do Código OTP (round-trip até sucesso=$sent) '
+      'levou ${otpSw.elapsedMilliseconds} ms',
+    );
 
     if (!mounted) return;
 
