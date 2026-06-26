@@ -3,7 +3,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.accumulator import (
@@ -14,7 +14,7 @@ from app.models.accumulator import (
     Witness,
 )
 from app.services.rsa_accumulator_adapter import rsa_accumulator_adapter
-from app.utils.timing import accumulate_duration, log_duration
+from app.utils.timing import accumulate_duration
 
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,64 @@ def state_fingerprint(state_value_hex: str) -> str:
     return hashlib.sha256(state_value_hex.strip().lower().encode("ascii")).hexdigest()
 
 
+RECORD_CHAIN_DOMAIN = "ACCUMULATOR-STATE-CHAIN-V1"
+GENESIS_PREV_HASH = "0" * 64
+
+
+def compute_record_hash(
+    prev_record_hash: str,
+    state_value_hex: str,
+    x_value_hex: str,
+    modulus_n_hex: str,
+    generator_hex: str,
+) -> str:
+    """
+    Hash encadeado de um registro de estado do acumulador. Liga cada estado ao
+    anterior por meio de ``prev_record_hash``, tornando a cadeia
+    tamper-evident: alterar um estado histórico (ou o representante que o
+    produziu) muda este ``record_hash`` e, por propagação, todos os
+    posteriores. A serialização é canônica e não ambígua (cada campo prefixado
+    pelo seu comprimento em 4 bytes big-endian). O estado inicial usa
+    ``prev_record_hash = GENESIS_PREV_HASH`` e ``x_value_hex`` vazio.
+    """
+    fields = [
+        ("dominio", RECORD_CHAIN_DOMAIN),
+        ("hash_registro_anterior", prev_record_hash),
+        ("valor_estado", state_value_hex),
+        ("representante_x", x_value_hex),
+        ("modulo_n", modulus_n_hex),
+        ("base_g", generator_hex),
+    ]
+    payload = bytearray()
+    for name, value in fields:
+        name_bytes = name.encode("utf-8")
+        value_bytes = value.encode("utf-8")
+        payload += len(name_bytes).to_bytes(4, "big") + name_bytes
+        payload += len(value_bytes).to_bytes(4, "big") + value_bytes
+    return hashlib.sha256(bytes(payload)).hexdigest()
+
+
 def hash_to_prime(hash_hex: str) -> int:
     return rsa_accumulator_adapter.backend.hash_to_prime(hash_hex)
+
+
+def _derive_unused_prime(hash_hex: str, used_x_hex: set[str]) -> tuple[int, int]:
+    """
+    Deriva o representante primo do evento via hash-to-prime, incrementando o
+    contador (nonce) até obter um primo AINDA NÃO utilizado no acumulador.
+
+    Trata explicitamente a colisão — computacionalmente improvável — de
+    representantes do esquema Baric-Pfitzmann: dois eventos distintos que
+    mapeassem para o mesmo primo quebrariam a equação de testemunha. Retorna
+    ``(x, nonce)``, em que ``nonce`` é o contador publicado que reproduz o
+    primo escolhido.
+    """
+    nonce = 0
+    while True:
+        result = rsa_accumulator_adapter.backend.hash_to_prime_with_nonce(hash_hex, nonce)
+        if _to_hex(result.prime) not in used_x_hex:
+            return result.prime, result.nonce
+        nonce = result.nonce + 1
 
 
 def _to_hex(value: int) -> str:
@@ -71,13 +127,23 @@ async def ensure_initial_state(
     if state:
         return state
 
-    generator, modulus_n = rsa_accumulator_adapter.generate_initial_parameters()
+    generator, modulus_n, base_counter = rsa_accumulator_adapter.generate_initial_parameters()
 
+    generator_hex = _to_hex(generator)
+    modulus_n_hex = _to_hex(modulus_n)
     state = AccumulatorState(
         previous_state_id=None,
-        state_value_hex=_to_hex(generator),
-        generator_hex=_to_hex(generator),
-        modulus_n_hex=_to_hex(modulus_n),
+        state_value_hex=generator_hex,
+        generator_hex=generator_hex,
+        modulus_n_hex=modulus_n_hex,
+        base_counter=base_counter,
+        record_hash=compute_record_hash(
+            prev_record_hash=GENESIS_PREV_HASH,
+            state_value_hex=generator_hex,
+            x_value_hex="",
+            modulus_n_hex=modulus_n_hex,
+            generator_hex=generator_hex,
+        ),
         created_by=created_by,
         comments=f"Estado inicial do acumulador RSA ({rsa_accumulator_adapter.backend_name})",
     )
@@ -91,252 +157,6 @@ async def ensure_initial_state(
     db.add(registry)
     await db.flush()
     return state
-
-
-async def materialize_witnesses_for_state(
-    db: AsyncSession,
-    state: AccumulatorState,
-    created_by: int | None = None,
-) -> dict[int, Witness]:
-    """
-    Geração SOB DEMANDA e EM LOTE das testemunhas de todos os elementos
-    incorporados até ``state``, via RootFactor — O(n log n) exponenciações,
-    custo amortizado O(log n) por testemunha (Boneh–Bünz–Fisch 2019, §4.1).
-
-    É o complemento do modo "testemunha sob demanda" adotado pelo sistema:
-    a acumulação não atualiza testemunha alguma (O(1)); quem precisa de uma
-    prova fresca contra um estado arbitrário (perícia, auditoria) paga o
-    lote aqui. O resultado é memoizado na tabela ``witness``: chamadas
-    subsequentes para o mesmo estado retornam do banco sem recomputar.
-    """
-    existing = await db.execute(
-        select(Witness).where(Witness.state_id == state.state_id)
-    )
-    witnesses_by_element_id: dict[int, Witness] = {
-        witness.element_id: witness for witness in existing.scalars().all()
-    }
-
-    result = await db.execute(
-        select(AccumulatorElement)
-        .join(
-            AccumulatorElementState,
-            AccumulatorElementState.element_id == AccumulatorElement.element_id,
-        )
-        .where(AccumulatorElementState.state_id <= state.state_id)
-        .order_by(AccumulatorElement.element_id)
-    )
-    elements = result.scalars().all()
-
-    if not elements or all(
-        element.element_id in witnesses_by_element_id for element in elements
-    ):
-        return witnesses_by_element_id
-
-    generator = _from_hex(state.generator_hex)
-    state_value = _from_hex(state.state_value_hex)
-    modulus_n = _from_hex(state.modulus_n_hex)
-    x_values = [_from_hex(element.x_value_hex) for element in elements]
-
-    def _compute() -> tuple[list[int], list[bool]]:
-        witness_values = rsa_accumulator_adapter.create_membership_witnesses(
-            generator=generator,
-            elements=x_values,
-            modulus_n=modulus_n,
-        )
-        validities = [
-            rsa_accumulator_adapter.verify_membership(
-                witness=witness_value,
-                element=x_value,
-                state_value=state_value,
-                modulus_n=modulus_n,
-            )
-            for witness_value, x_value in zip(witness_values, x_values)
-        ]
-        return witness_values, validities
-
-    witness_values, validities = await asyncio.to_thread(_compute)
-
-    for element, witness_value, is_valid in zip(elements, witness_values, validities):
-        if element.element_id in witnesses_by_element_id:
-            continue
-        witness = Witness(
-            element_id=element.element_id,
-            state_id=state.state_id,
-            witness_value_hex=_to_hex(witness_value),
-            created_by=created_by,
-            is_valid=is_valid,
-        )
-        db.add(witness)
-        witnesses_by_element_id[element.element_id] = witness
-
-    await db.flush()
-    return witnesses_by_element_id
-
-
-async def get_witness_on_demand(
-    db: AsyncSession,
-    element_id: int,
-    state_id: int | None = None,
-) -> dict | None:
-    """
-    Testemunha de um elemento contra um estado arbitrário da cadeia (o mais
-    recente, se ``state_id`` for None), materializando o lote daquele estado
-    se ainda não existir. Retorna None se o estado não existe ou se o
-    elemento ainda não havia sido incorporado até ele.
-    """
-    if state_id is None:
-        state = await get_latest_state(db)
-    else:
-        result = await db.execute(
-            select(AccumulatorState).where(AccumulatorState.state_id == state_id)
-        )
-        state = result.scalars().first()
-    if not state:
-        return None
-
-    witnesses = await materialize_witnesses_for_state(db, state)
-    witness = witnesses.get(element_id)
-    if witness is None:
-        return None
-
-    element_result = await db.execute(
-        select(AccumulatorElement).where(AccumulatorElement.element_id == element_id)
-    )
-    element = element_result.scalars().first()
-
-    return {
-        "element_id": element_id,
-        "state_id": state.state_id,
-        "state_value_hex": state.state_value_hex,
-        "state_sha256": state_fingerprint(state.state_value_hex),
-        "modulus_n_hex": state.modulus_n_hex,
-        "x_hex": element.x_value_hex,
-        "x_nonce": element.x_nonce,
-        "witness_hex": witness.witness_value_hex,
-        "valid": witness.is_valid,
-    }
-
-
-async def get_single_witness_on_demand(
-    db: AsyncSession,
-    element_id: int,
-    state_id: int | None = None,
-) -> dict | None:
-    """
-    Testemunha de pertencimento de UM elemento contra um estado, calculada
-    isoladamente: ``w = g^(produto dos demais x) mod N``.
-
-    É o caminho pericial endurecido: ao contrário de
-    ``materialize_witnesses_for_state`` (lote RootFactor, O(n log n) e até n
-    inserções), aqui a perícia pede a prova de UMA assinatura, então o custo é
-    uma única exponenciação modular e UMA linha inserida — eliminando o vetor
-    de amplificação (O(n²) de armazenamento) do endpoint sob demanda.
-
-    Memoizado: se a testemunha (element, state) já existir, retorna do banco.
-    Retorna None se o estado/elemento não existe ou se o elemento ainda não
-    havia sido incorporado até o estado solicitado.
-    """
-    if state_id is None:
-        state = await get_latest_state(db)
-    else:
-        result = await db.execute(
-            select(AccumulatorState).where(AccumulatorState.state_id == state_id)
-        )
-        state = result.scalars().first()
-    if not state:
-        return None
-
-    element_result = await db.execute(
-        select(AccumulatorElement).where(AccumulatorElement.element_id == element_id)
-    )
-    element = element_result.scalars().first()
-    if element is None:
-        return None
-
-    incorporated = await db.scalar(
-        select(func.count())
-        .select_from(AccumulatorElementState)
-        .where(
-            AccumulatorElementState.element_id == element_id,
-            AccumulatorElementState.state_id <= state.state_id,
-        )
-    )
-    if not incorporated:
-        return None
-
-    existing = await db.execute(
-        select(Witness).where(
-            Witness.element_id == element_id,
-            Witness.state_id == state.state_id,
-        )
-    )
-    witness = existing.scalars().first()
-
-    if witness is not None:
-        logger.info(
-            "[TEMPO] Testemunha sob Demanda servida do cache (memoizada, ~0 ms) "
-            "| element_id=%s | state_id=%s",
-            element_id,
-            state.state_id,
-        )
-    else:
-        generator = _from_hex(state.generator_hex)
-        modulus_n = _from_hex(state.modulus_n_hex)
-        state_value = _from_hex(state.state_value_hex)
-        x_target = _from_hex(element.x_value_hex)
-
-        others = await db.execute(
-            select(AccumulatorElement.x_value_hex)
-            .join(
-                AccumulatorElementState,
-                AccumulatorElementState.element_id == AccumulatorElement.element_id,
-            )
-            .where(
-                AccumulatorElementState.state_id <= state.state_id,
-                AccumulatorElement.element_id != element_id,
-            )
-        )
-        other_x_values = [_from_hex(value) for value in others.scalars().all()]
-
-        def _compute() -> tuple[int, bool]:
-            exponent = 1
-            for value in other_x_values:
-                exponent *= value
-            witness_value = pow(generator, exponent, modulus_n)
-            is_valid = pow(witness_value, x_target, modulus_n) == state_value
-            return witness_value, is_valid
-
-        # Mede SÓ a geração da testemunha (witness = g^(produto dos demais x)
-        # mod N): a parte cara e O(n) do endpoint /accumulator/witness.
-        with log_duration(
-            logger,
-            "Geração de Testemunha sob Demanda (witness = g^(prod x_i) mod n)",
-            element_id=element_id,
-            state_id=state.state_id,
-            n_outros=len(other_x_values),
-        ):
-            witness_value, is_valid = await asyncio.to_thread(_compute)
-
-        witness = Witness(
-            element_id=element_id,
-            state_id=state.state_id,
-            witness_value_hex=_to_hex(witness_value),
-            is_valid=is_valid,
-        )
-        db.add(witness)
-        await db.flush()
-
-    return {
-        "element_id": element_id,
-        "state_id": state.state_id,
-        "state_value_hex": state.state_value_hex,
-        "state_sha256": state_fingerprint(state.state_value_hex),
-        "modulus_n_hex": state.modulus_n_hex,
-        "x_hex": element.x_value_hex,
-        "x_nonce": element.x_nonce,
-        "witness_hex": witness.witness_value_hex,
-        "valid": witness.is_valid,
-    }
 
 
 async def accumulate_signature(
@@ -376,19 +196,35 @@ async def accumulate_signature(
     old_state_value = _from_hex(current_state.state_value_hex)
     modulus_n = _from_hex(current_state.modulus_n_hex)
 
-    with accumulate_duration(timings, "cripto"):
-        computation = await asyncio.to_thread(
-            rsa_accumulator_adapter.accumulate,
-            current_value=old_state_value,
-            hash_hex=hash_hex,
-            modulus_n=modulus_n,
-        )
+    with accumulate_duration(timings, "io_db"):
+        used_x_result = await db.execute(select(AccumulatorElement.x_value_hex))
+        used_x_hex = set(used_x_result.scalars().all())
 
+    def _compute() -> tuple[int, int, int]:
+        x_value, x_nonce = _derive_unused_prime(hash_hex, used_x_hex)
+        new_value = rsa_accumulator_adapter.backend.add(
+            old_state_value, x_value, modulus_n
+        )
+        return x_value, x_nonce, new_value
+
+    with accumulate_duration(timings, "cripto"):
+        x_value, x_nonce, new_value = await asyncio.to_thread(_compute)
+
+    new_state_value_hex = _to_hex(new_value)
+    x_value_hex = _to_hex(x_value)
     state = AccumulatorState(
         previous_state_id=current_state.state_id,
-        state_value_hex=_to_hex(computation.new_value),
+        state_value_hex=new_state_value_hex,
         generator_hex=current_state.generator_hex,
         modulus_n_hex=current_state.modulus_n_hex,
+        base_counter=current_state.base_counter,
+        record_hash=compute_record_hash(
+            prev_record_hash=current_state.record_hash or GENESIS_PREV_HASH,
+            state_value_hex=new_state_value_hex,
+            x_value_hex=x_value_hex,
+            modulus_n_hex=current_state.modulus_n_hex,
+            generator_hex=current_state.generator_hex,
+        ),
         created_by=created_by,
         comments=(
             f"Documento {document_id} assinado e acumulado "
@@ -399,8 +235,8 @@ async def accumulate_signature(
         document_id=document_id,
         signature_id=signature_id,
         hash_hex=hash_hex,
-        x_value_hex=_to_hex(computation.x_value),
-        x_nonce=computation.x_nonce,
+        x_value_hex=x_value_hex,
+        x_nonce=x_nonce,
         created_by=created_by,
     )
 

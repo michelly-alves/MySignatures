@@ -196,7 +196,7 @@ class DocumentCryptoSigner {
     final pbkdf2Params = JSObject();
     pbkdf2Params['name'] = 'PBKDF2'.toJS;
     pbkdf2Params['salt'] = salt.toJS;
-    pbkdf2Params['iterations'] = 100000.toJS;
+    pbkdf2Params['iterations'] = 600000.toJS;
     pbkdf2Params['hash'] = 'SHA-256'.toJS;
 
     final aesAlgo = JSObject();

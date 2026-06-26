@@ -1,50 +1,15 @@
-import time
-
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.models.accumulator import AccumulatorElement
-from app.models.digital_signature import DigitalSignature
-from app.models.user import Role, User
-from app.security.roles import require_roles
 from app.services.accumulator_service import (
     get_latest_state,
     get_public_registry_page,
-    get_single_witness_on_demand,
     state_fingerprint,
 )
-from app.api.v1.responses import err, _401, _500
+from app.api.v1.responses import err, _500
 
 router = APIRouter(prefix="/accumulator", tags=["Accumulator"])
-
-# Rate-limit do caminho pericial (testemunha sob demanda): no máximo 60
-# solicitações por minuto por administrador, protegendo a operação cara
-# (exponenciação modular + escrita) contra abuso/DoS.
-_WITNESS_MAX_PER_WINDOW = 60
-_WITNESS_WINDOW_SECONDS = 60
-_witness_request_counters: dict[str, dict] = {}
-
-
-def _check_witness_rate_limit(identifier: str) -> None:
-    now = time.monotonic()
-    record = _witness_request_counters.get(
-        identifier, {"count": 0, "window_start": now}
-    )
-    if now - record["window_start"] > _WITNESS_WINDOW_SECONDS:
-        record = {"count": 0, "window_start": now}
-    if record["count"] >= _WITNESS_MAX_PER_WINDOW:
-        remaining = int(_WITNESS_WINDOW_SECONDS - (now - record["window_start"]))
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=(
-                f"Limite de {_WITNESS_MAX_PER_WINDOW} solicitações de testemunha "
-                f"por minuto excedido. Tente novamente em {remaining} segundos."
-            ),
-        )
-    record["count"] += 1
-    _witness_request_counters[identifier] = record
 
 
 @router.get("/current", responses=(
@@ -126,80 +91,4 @@ async def get_public_accumulator_registry(
         "generator_hex": first_state.generator_hex if first_state else None,
         "items": items,
         "next_after_state_id": items[-1]["state_id"] if len(items) == limit else None,
-    }
-
-
-@router.get("/witness/{validation_code}", responses=(
-    _401 |
-    err(403, "Sem permissão", "Apenas administradores podem gerar testemunhas sob demanda.") |
-    err(404, "Não encontrado",
-        "Assinatura não encontrada, ou estado anterior à incorporação dela.") |
-    err(429, "Limite excedido", "Limite de 60 solicitações por minuto excedido.") |
-    _500
-))
-async def get_witness_for_validation_code(
-    validation_code: str,
-    state_id: int | None = Query(
-        None,
-        ge=1,
-        description=(
-            "Estado-alvo da prova (ex.: um estado arquivado por um espelho "
-            "do registro público). Se omitido, usa o estado mais recente."
-        ),
-    ),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_roles(Role.COMPANY)),
-):
-    """
-    Testemunha sob demanda (caminho pericial do modo lazy) — ENDURECIDO.
-
-    Acesso restrito a administradores e limitado a 60 solicitações por minuto,
-    por se tratar de operação criptográfica cara com escrita no banco.
-
-    Gera a testemunha de pertencimento de UMA assinatura (identificada pelo
-    código de validação) contra o estado solicitado, calculada isoladamente
-    (``w = g^(produto dos demais x) mod N``): uma exponenciação modular e UMA
-    linha inserida — sem o lote RootFactor, evitando a amplificação O(n²) de
-    armazenamento. Memoizado por (elemento, estado). Verificação pelo perito:
-    pow(int(witness_hex,16), int(x_hex,16), int(modulus_n_hex,16)) ==
-    int(state_value_hex,16).
-    """
-    _check_witness_rate_limit(str(current_user.user_id))
-
-    result = await db.execute(
-        select(AccumulatorElement.element_id)
-        .join(
-            DigitalSignature,
-            DigitalSignature.signature_id == AccumulatorElement.signature_id,
-        )
-        .where(DigitalSignature.validation_code == validation_code)
-    )
-    element_id = result.scalars().first()
-    if element_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Assinatura não encontrada.",
-        )
-
-    proof = await get_single_witness_on_demand(db, element_id=element_id, state_id=state_id)
-    if proof is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=(
-                "Estado inexistente ou anterior à incorporação desta assinatura "
-                "no acumulador."
-            ),
-        )
-
-    await db.commit()
-
-    return {
-        "descricao": (
-            "Prova de pertencimento gerada sob demanda contra o estado "
-            "solicitado. Verifique: witness^x ≡ estado (mod n). Confira o "
-            "state_sha256 com o impresso no selo do PDF ou com um espelho "
-            "do registro público (/accumulator/registry)."
-        ),
-        "validation_code": validation_code,
-        **proof,
     }

@@ -10,6 +10,13 @@ class AccumulatorState(Base):
     state_value_hex = Column(Text, nullable=False)
     generator_hex = Column(Text, nullable=False)
     modulus_n_hex = Column(Text, nullable=False)
+    # Contador público da derivação determinística da base g (g = h² mod N).
+    base_counter = Column(Integer, nullable=True)
+    # Encadeamento por hash dos registros de estado: record_hash =
+    # H(dominio ‖ hash do registro anterior ‖ valor do estado ‖ x incluído ‖
+    # N ‖ g). Torna a cadeia tamper-evident — alterar um estado histórico
+    # exige recomputar todos os record_hash posteriores.
+    record_hash = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     created_by = Column(Integer, nullable=True)
     comments = Column(Text, nullable=True)

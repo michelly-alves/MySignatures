@@ -12,9 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db import get_db
-from app.services import signature_service
+from app.dependencies.auth import get_current_user
+from app.models.user import User
+from app.services import document_service, signature_service
 from app.utils.hashing import compute_file_sha256
-from app.api.v1.responses import err, _500
+from app.api.v1.responses import err, _401, _500
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +146,14 @@ async def validate_signature_publicly(
     )
     safe_public_key = _safe_public_key_pem(result["public_key_pem"])
 
+    canonical_event = signature_service.build_canonical_event(
+        document_hash=document.hash_sha256,
+        signature_base64=signature.signature_data,
+        public_key_pem=result["public_key_pem"],
+        validation_code=signature.validation_code,
+        signed_at=signature.signed_at,
+    )
+
     actual_file_hash = await asyncio.to_thread(compute_file_sha256, document.file_path)
     arquivo_integro = (
         None if actual_file_hash is None
@@ -225,25 +235,45 @@ async def validate_signature_publicly(
             "observacao": (
                 "Hash do arquivo PDF ORIGINAL, anterior à aplicação do selo "
                 "visual (o PDF selado tem bytes diferentes por construção). "
-                "Para conferir de forma independente, baixe o original em "
-                "'arquivo_original_url', calcule o SHA-256 e compare com o "
-                "hash acima. 'arquivo_integro_no_servidor' é a reconferência "
-                "feita pelo servidor neste instante (true = arquivo em disco "
-                "ainda produz o hash registrado)."
+                "Para conferir os bytes do arquivo, baixe o original em "
+                "'arquivo_original_url' (acesso restrito: requer autenticação "
+                "como empresa proprietária ou signatário do documento), "
+                "calcule o SHA-256 e compare com o hash acima. "
+                "'arquivo_integro_no_servidor' é a reconferência feita pelo "
+                "servidor neste instante (true = arquivo em disco ainda produz "
+                "o hash registrado)."
             ),
         },
 
         "evento_de_assinatura": {
             "descricao": (
-                "Cada evento de assinatura é mapeado para um hash composto "
-                "que inclui o documento, identificadores internos da operação "
-                "e o momento da assinatura. Esse hash é o que é efetivamente "
-                "registrado no acumulador. Os identificadores internos não são "
-                "expostos publicamente — a verificação criptográfica de "
-                "pertencimento usa diretamente o valor `x` (campo `x_hex` na "
-                "prova técnica), sem depender da reprodução do hash composto."
+                "O evento de assinatura é serializado de forma canônica, com "
+                "separação de domínio e versão explícita, a partir EXCLUSIVAMENTE "
+                "de campos públicos, e então hasheado com SHA-256. Esse hash é o "
+                "que é registrado no acumulador. Um verificador externo pode "
+                "reproduzir 'hash_evento' a partir dos campos abaixo e, em "
+                "seguida, derivar o representante primo 'x_hex' (na prova técnica)."
             ),
+            "dominio": canonical_event["dominio"],
+            "versao_formato": canonical_event["versao"],
+            "hash_documento": canonical_event["hash_documento"],
+            "hash_assinatura": canonical_event["hash_assinatura"],
+            "hash_chave_publica": canonical_event["hash_chave_publica"],
+            "codigo_publico": canonical_event["codigo_publico"],
+            "timestamp_iso8601": canonical_event["timestamp_iso8601"],
+            "hash_evento": canonical_event["hash_evento"],
             "hash_composto_sha256": element.hash_hex,
+            "hash_evento_reproduzivel": canonical_event["hash_evento"] == element.hash_hex,
+            "serializacao": (
+                "Para cada campo, na ordem [dominio, versao, hash_documento, "
+                "hash_assinatura, hash_chave_publica, codigo_publico, "
+                "timestamp_iso8601], concatene: comprimento do nome (4 bytes "
+                "big-endian) ‖ nome ‖ comprimento do valor (4 bytes big-endian) "
+                "‖ valor (UTF-8). hash_evento = SHA-256 dessa serialização. "
+                "hash_assinatura = SHA-256 dos bytes brutos da assinatura; "
+                "hash_chave_publica = SHA-256 do DER (SubjectPublicKeyInfo) da "
+                "chave pública."
+            ),
             "assinado_em": signed_at_iso,
         },
 
@@ -255,12 +285,20 @@ async def validate_signature_publicly(
                 "em um acumulador criptográfico RSA."
             ),
             "assinatura_rsa": {
-                "algoritmo": "RSA-PSS com SHA-256 e salt de 32 bytes",
+                "algoritmo": "RSA-PSS com SHA-256, MGF1-SHA256 e salt de 32 bytes",
                 "signature_base64": signature.signature_data,
                 "public_key_pem": safe_public_key,
+                "mensagem_assinada": (
+                    "A mensagem assinada NÃO é o digest binário do documento, e sim "
+                    "o 'hash_documento' como string hexadecimal minúscula de 64 "
+                    "caracteres, codificada em ASCII/UTF-8. O esquema RSA-PSS aplica "
+                    "SHA-256 sobre esses bytes."
+                ),
                 "equacao_de_verificacao": (
-                    "RSA-PSS.verify(public_key_pem, sha256(documento), "
-                    "signature_base64) == True"
+                    "RSA-PSS.verify(public_key_pem, "
+                    "mensagem=ASCII(hash_documento), "
+                    "assinatura=base64_decode(signature_base64), hash=SHA-256, "
+                    "mgf=MGF1-SHA256, salt=32) == True"
                 ),
             },
             "pertencimento_ao_acumulador": {
@@ -273,8 +311,20 @@ async def validate_signature_publicly(
                 "acumulador_hex": state.state_value_hex,
                 "modulo_n_hex": state.modulus_n_hex,
                 "gerador_hex": state.generator_hex,
+                "gerador_contador": state.base_counter,
+                "gerador_derivacao": (
+                    "Base derivada deterministicamente: g = h² mod N, com "
+                    "h = SHA-256('ACCUMULATOR-BASE-V1:' ‖ N ‖ ':' ‖ gerador_contador) "
+                    "mod N, exigindo gcd(h, N) = 1 e g ∉ {0, 1}."
+                ),
                 "x_hex": element.x_value_hex,
                 "x_nonce": element.x_nonce,
+                "x_derivacao": (
+                    "Representante primo derivado de "
+                    "SHA-256('H2P-V1:' ‖ hash_evento ‖ ':' ‖ x_nonce), tornado "
+                    "ímpar e validado por Miller-Rabin; x_nonce é o contador que "
+                    "produziu o primo."
+                ),
                 "witness_hex": witness.witness_value_hex,
             },
         },
@@ -282,6 +332,9 @@ async def validate_signature_publicly(
 
 
 @router.get("/{validation_code}/original", responses=(
+    _401 |
+    err(403, "Sem permissão",
+        "Você não tem permissão para baixar o documento original.") |
     err(404, "Não encontrado", "Assinatura ou arquivo original não encontrado.") |
     err(409, "Integridade violada",
         "O arquivo original armazenado não corresponde ao hash registrado.") |
@@ -289,10 +342,17 @@ async def validate_signature_publicly(
 ))
 async def download_original_document(
     validation_code: str,
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Serve o PDF ORIGINAL (pré-selo) para verificação independente.
+    Serve o PDF ORIGINAL (pré-selo) para verificação dos bytes do arquivo.
+
+    Acesso RESTRITO: embora o hash, a assinatura RSA-PSS e a prova de
+    pertencimento ao acumulador sejam públicos, o download do documento
+    original exige autenticação e autorização, sendo permitido apenas à
+    empresa proprietária e aos signatários do documento, pois o arquivo pode
+    conter dados pessoais (LGPD).
 
     O hash registrado e assinado refere-se a este arquivo — o PDF selado tem
     bytes diferentes por construção. Antes de servir, o servidor reconfere o
@@ -306,6 +366,14 @@ async def download_original_document(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Assinatura não encontrada.",
+        )
+
+    if not await document_service.can_user_access_document(
+        db, current_user, document.document_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para baixar o documento original.",
         )
 
     def _read_file(path: str | None) -> bytes | None:

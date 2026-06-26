@@ -7,6 +7,13 @@ from typing import Protocol
 
 MIN_GENERATOR_VALUE = 2
 
+# Separação de domínio (e versão) das funções determinísticas do acumulador.
+# As tags entram nas pré-imagens dos hashes para que valores derivados aqui não
+# colidam com hashes produzidos em outros contextos e para versionar a
+# derivação, permitindo a reprodução externa por um verificador independente.
+H2P_DOMAIN = "H2P-V1"                              # hash-to-prime
+ACCUMULATOR_BASE_DOMAIN = "ACCUMULATOR-BASE-V1"    # derivação da base g
+
 # ---------------------------------------------------------------------------
 # Módulo RSA de ordem desconhecida (Unknown-Order RSA Modulus)
 #
@@ -69,6 +76,9 @@ class RsaAccumulatorBackend(Protocol):
     def generate_generator(self, modulus_n: int) -> int:
         ...
 
+    def derive_base(self, modulus_n: int, start_counter: int = 0) -> tuple[int, int]:
+        ...
+
     def add(self, current_value: int, element: int, modulus_n: int) -> int:
         ...
 
@@ -86,7 +96,9 @@ class InternalRsaAccumulatorBackend:
         current_nonce = nonce
         while True:
             candidate = int(
-                hashlib.sha256(f"{hash_hex}:{current_nonce}".encode("ascii")).hexdigest(),
+                hashlib.sha256(
+                    f"{H2P_DOMAIN}:{hash_hex}:{current_nonce}".encode("ascii")
+                ).hexdigest(),
                 16,
             )
             candidate |= 1
@@ -102,11 +114,43 @@ class InternalRsaAccumulatorBackend:
         # satisfazendo a premissa de ordem desconhecida do acumulador RSA.
         return RSA_2048_CHALLENGE_N
 
-    def generate_generator(self, modulus_n: int) -> int:
+    def derive_base(self, modulus_n: int, start_counter: int = 0) -> tuple[int, int]:
+        """
+        Base pública do acumulador derivada DETERMINISTICAMENTE dos parâmetros
+        do sistema, em vez de sorteada. A partir de um contador público, deriva
+        um valor h por SHA-256 com separação de domínio ligada ao módulo N;
+        exige gcd(h, N) = 1 e define:
+
+            g = h² mod N
+
+        garantindo que g seja um resíduo quadrático — o que evita elementos de
+        ordem baixa (como o subgrupo gerado por -1) — e rejeitando os valores
+        triviais 0 e 1. Caso alguma condição falhe, o contador é incrementado e
+        a derivação é repetida.
+
+        Retorna ``(g, contador)``: o contador é publicado como parâmetro do
+        acumulador para que um verificador externo reproduza g sem precisar
+        repetir o laço de derivação.
+        """
+        counter = start_counter
+        n_bytes = (modulus_n.bit_length() + 7) // 8
+        modulus_bytes = modulus_n.to_bytes(n_bytes, "big")
         while True:
-            candidate = secrets.randbelow(modulus_n - MIN_GENERATOR_VALUE) + MIN_GENERATOR_VALUE
-            if math.gcd(candidate, modulus_n) == 1:
-                return candidate
+            digest = hashlib.sha256(
+                f"{ACCUMULATOR_BASE_DOMAIN}:".encode("ascii")
+                + modulus_bytes
+                + f":{counter}".encode("ascii")
+            ).digest()
+            h = int.from_bytes(digest, "big") % modulus_n
+            if h > 1 and math.gcd(h, modulus_n) == 1:
+                g = pow(h, 2, modulus_n)
+                if g not in (0, 1):
+                    return g, counter
+            counter += 1
+
+    def generate_generator(self, modulus_n: int) -> int:
+        base, _ = self.derive_base(modulus_n)
+        return base
 
     def add(self, current_value: int, element: int, modulus_n: int) -> int:
         return pow(current_value, element, modulus_n)
@@ -123,10 +167,10 @@ class RsaAccumulatorAdapter:
     def backend_name(self) -> str:
         return self.backend.name
 
-    def generate_initial_parameters(self) -> tuple[int, int]:
+    def generate_initial_parameters(self) -> tuple[int, int, int]:
         modulus_n = self.backend.generate_modulus()
-        generator = self.backend.generate_generator(modulus_n)
-        return generator, modulus_n
+        generator, base_counter = self.backend.derive_base(modulus_n)
+        return generator, modulus_n, base_counter
 
     def accumulate(
         self,
@@ -157,14 +201,6 @@ class RsaAccumulatorAdapter:
             state_value=state_value,
             modulus_n=modulus_n,
         )
-
-    def create_membership_witnesses(
-        self,
-        generator: int,
-        elements: list[int],
-        modulus_n: int,
-    ) -> list[int]:
-        return _root_factor(generator, elements, modulus_n)
 
 
 def _miller_rabin_round(value: int, d: int, s: int, base: int) -> bool:
@@ -206,36 +242,6 @@ def _is_probable_prime(value: int) -> bool:
             return False
 
     return True
-
-
-def _calculate_product(values: list[int]) -> int:
-    result = 1
-    for value in values:
-        result *= value
-    return result
-
-
-def _root_factor(generator: int, elements: list[int], modulus_n: int) -> list[int]:
-    element_count = len(elements)
-    if element_count == 0:
-        return []
-    if element_count == 1:
-        return [generator]
-
-    split_index = element_count // 2
-    left = elements[:split_index]
-    right = elements[split_index:]
-
-    right_product = _calculate_product(right)
-    left_product = _calculate_product(left)
-
-    left_generator = pow(generator, right_product, modulus_n)
-    right_generator = pow(generator, left_product, modulus_n)
-
-    return (
-        _root_factor(left_generator, left, modulus_n)
-        + _root_factor(right_generator, right, modulus_n)
-    )
 
 
 rsa_accumulator_adapter = RsaAccumulatorAdapter()

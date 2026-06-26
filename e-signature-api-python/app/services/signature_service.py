@@ -121,29 +121,99 @@ def canonical_signed_at_iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def _build_event_hash(
-    document_hash: str,
-    signer_id: int,
-    signature_id: int,
-    signed_at: datetime,
-) -> str:
+# Separação de domínio e versão do formato do evento de assinatura. Entram
+# no início da serialização canônica para que o hash do evento não colida
+# com hashes produzidos por outros contextos ou por versões futuras do
+# formato, conforme a codificação canônica com versão explícita.
+EVENT_DOMAIN = "SIGNATURE-ACCUMULATOR-V1"
+EVENT_FORMAT_VERSION = "1"
+
+
+def _public_key_fingerprint(public_key_pem: str) -> str:
     """
-    Hash criptograficamente distinguível do evento de assinatura.
+    Impressão digital SHA-256 da chave pública sobre o DER canônico
+    (SubjectPublicKeyInfo), tolerante a diferenças de formatação do PEM
+    (quebras de linha, espaços).
+    """
+    key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+    der = key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(der).hexdigest()
 
-    Combina o hash do documento com identificadores únicos da operação
-    (signer_id, signature_id, timestamp ISO 8601 canônico), garantindo
-    que cada assinatura — mesmo sobre o mesmo documento — produza um
-    elemento `x` distinto no acumulador. Preserva o invariante de primos
-    únicos do esquema Baric & Pfitzmann (1997).
 
-    Os identificadores internos (signer_id, signature_id) compõem o hash
-    mas NÃO são expostos no endpoint público; a verificação externa de
-    pertencimento usa diretamente o valor `x` derivado do hash, sem
-    necessidade de reproduzir o hash composto.
+def _signature_fingerprint(signature_base64: str) -> str:
+    """Impressão digital SHA-256 sobre os bytes brutos da assinatura digital."""
+    raw = base64.b64decode(signature_base64, validate=True)
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _canonical_event_payload(fields: list[tuple[str, str]]) -> bytes:
+    """
+    Serialização canônica e não ambígua dos campos do evento: cada campo é
+    codificado como (comprimento do nome ‖ nome ‖ comprimento do valor ‖
+    valor), com os comprimentos em 4 bytes big-endian. O prefixo de
+    comprimento elimina a ambiguidade da concatenação simples de campos de
+    tamanho variável, em que um separador presente em um valor deslocaria o
+    restante.
+    """
+    payload = bytearray()
+    for name, value in fields:
+        name_bytes = name.encode("utf-8")
+        value_bytes = value.encode("utf-8")
+        payload += len(name_bytes).to_bytes(4, "big") + name_bytes
+        payload += len(value_bytes).to_bytes(4, "big") + value_bytes
+    return bytes(payload)
+
+
+def build_canonical_event(
+    document_hash: str,
+    signature_base64: str,
+    public_key_pem: str,
+    validation_code: str,
+    signed_at: datetime,
+) -> dict:
+    """
+    Codificação canônica do evento de assinatura a partir EXCLUSIVAMENTE de
+    campos públicos ou publicáveis, permitindo que um verificador externo
+    reproduza o hash do evento sem acesso a identificadores internos do banco.
+
+    O evento combina, com separação de domínio e versão explícita: o hash do
+    documento, o hash da assinatura digital, a impressão digital da chave
+    pública, o código público de validação e o timestamp ISO 8601 canônico.
+    A unicidade de cada evento — mesmo sobre o mesmo documento — é garantida
+    pelo código público de validação (128 bits de entropia) somado ao
+    timestamp, preservando o invariante de representantes distintos do
+    esquema Baric & Pfitzmann (1997).
+
+    Retorna o dicionário com todos os campos canônicos e o hash do evento
+    (chave ``hash_evento``), reutilizado tanto na acumulação quanto na
+    exposição pública dos dados de verificação.
     """
     signed_at_iso = canonical_signed_at_iso(signed_at)
-    payload = f"{document_hash}|{signer_id}|{signature_id}|{signed_at_iso}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    signature_hash = _signature_fingerprint(signature_base64)
+    public_key_hash = _public_key_fingerprint(public_key_pem)
+    fields = [
+        ("dominio", EVENT_DOMAIN),
+        ("versao", EVENT_FORMAT_VERSION),
+        ("hash_documento", document_hash),
+        ("hash_assinatura", signature_hash),
+        ("hash_chave_publica", public_key_hash),
+        ("codigo_publico", validation_code),
+        ("timestamp_iso8601", signed_at_iso),
+    ]
+    event_hash = hashlib.sha256(_canonical_event_payload(fields)).hexdigest()
+    return {
+        "dominio": EVENT_DOMAIN,
+        "versao": EVENT_FORMAT_VERSION,
+        "hash_documento": document_hash,
+        "hash_assinatura": signature_hash,
+        "hash_chave_publica": public_key_hash,
+        "codigo_publico": validation_code,
+        "timestamp_iso8601": signed_at_iso,
+        "hash_evento": event_hash,
+    }
 
 
 async def _gather_seal_entries(db: AsyncSession, document_id: int) -> list[dict]:
@@ -275,12 +345,14 @@ async def sign_document(
     await db.flush()
     await db.refresh(digital_signature)
 
-    event_hash = _build_event_hash(
+    event = build_canonical_event(
         document_hash=document.hash_sha256,
-        signer_id=signer.signer_id,
-        signature_id=digital_signature.signature_id,
+        signature_base64=digital_signature.signature_data,
+        public_key_pem=public_key_pem,
+        validation_code=digital_signature.validation_code,
         signed_at=digital_signature.signed_at,
     )
+    event_hash = event["hash_evento"]
 
     with log_duration(
         logger,
