@@ -1,4 +1,4 @@
-# MySignatures — Sistema de Assinatura Eletrônica
+# LockIn — Sistema de Assinatura Eletrônica
 
 Plataforma de assinatura eletrônica de documentos com verificação facial, OTP,
 selo digital em PDF e validação pública de assinaturas via acumulador RSA.
