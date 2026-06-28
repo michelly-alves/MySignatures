@@ -180,6 +180,8 @@ class _CreateDocumentScreenState extends State<CreateDocumentScreen> {
         content: Text('Documento enviado com sucesso!'),
       ));
       navigator.pop();
+    } else if (_isPhotoQualityError(error)) {
+      await _showPhotoErrorDialog(_friendlyBackendError(error));
     } else {
       scaffoldMessenger.showSnackBar(SnackBar(
         backgroundColor: Colors.redAccent,
@@ -187,6 +189,44 @@ class _CreateDocumentScreenState extends State<CreateDocumentScreen> {
         duration: const Duration(seconds: 4),
       ));
     }
+  }
+
+  bool _isPhotoQualityError(String raw) {
+    final lower = raw.toLowerCase();
+    return lower.contains('biometria') ||
+        lower.contains('rosto') ||
+        lower.contains('foto');
+  }
+
+  Future<void> _showPhotoErrorDialog(String message) {
+    return showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        icon: const Icon(Icons.image_not_supported_outlined,
+            color: Colors.redAccent, size: 40),
+        title: Text(
+          'Problema com a foto',
+          style: GoogleFonts.poppins(fontWeight: FontWeight.bold),
+        ),
+        content: Text(
+          message,
+          style: GoogleFonts.poppins(fontSize: 14),
+        ),
+        actions: [
+          ElevatedButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.primaryButton,
+              foregroundColor: Colors.white,
+              shape:
+                  RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            child: const Text('Entendi'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _snack(String message, Color color) {

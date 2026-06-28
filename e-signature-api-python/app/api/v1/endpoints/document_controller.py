@@ -28,6 +28,10 @@ from app.security.roles import require_roles
 from app.models.user import Role
 from app.models.user import User
 from app.models.company import Company
+from app.models.signer import Signer
+from app.models.document_signer import DocumentSigner
+from app.models.signer_status import SignerStatus
+from app.services.face_recognition import extract_enrollment_embedding
 from app.dependencies.auth import get_current_user
 from app.api.v1.responses import err, _401, _422, _500
 
@@ -217,7 +221,6 @@ async def create_document(
     with log_duration(logger, "Cálculo do Hash do Documento", file_name=document_file.filename, size_bytes=len(doc_bytes)):
         hash_sha256 = hashlib.sha256(doc_bytes).hexdigest()
 
-    # Uma foto por signatário (mesma ordem da lista), gravadas só após validar.
     signer_inputs: list[SignerInput] = []
     photos_to_write: list[tuple[Path, bytes]] = []
     for signer, photo in zip(signers_data, signer_photos):
@@ -274,9 +277,97 @@ async def create_document(
         )
         
         
+@router.put("/{document_id}/signers/{signer_id}/photo", responses=(
+    err(400, "Foto inválida", "O rosto na foto está pequeno demais para biometria.") |
+    _401 |
+    err(403, "Sem permissão", "Você não tem permissão para alterar este documento.") |
+    err(404, "Não encontrado", "Signatário não vinculado a este documento.") |
+    err(409, "Já validado", "O signatário já validou a identidade; não é possível trocar a foto.") |
+    err(413, "Arquivo muito grande", "O arquivo excede o limite de 5MB.") |
+    _500
+))
+async def replace_signer_photo(
+    document_id: int,
+    signer_id: int,
+    photo_file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    allowed = await document_service.can_user_manage_document(
+        db, current_user, document_id
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para alterar este documento."
+        )
+
+    result = await db.execute(
+        select(DocumentSigner).where(
+            DocumentSigner.document_id == document_id,
+            DocumentSigner.signer_id == signer_id,
+        )
+    )
+    doc_signer = result.scalar_one_or_none()
+    if not doc_signer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Signatário não vinculado a este documento."
+        )
+
+    if doc_signer.status_id in (
+        SignerStatus.IDENTITY_VERIFIED.value,
+        SignerStatus.SIGNED.value,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="O signatário já validou a identidade; não é possível trocar a foto."
+        )
+
+    result = await db.execute(
+        select(Signer).where(
+            Signer.signer_id == signer_id,
+            Signer.deleted_at.is_(None),
+        )
+    )
+    signer = result.scalar_one_or_none()
+    if not signer:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Signatário não encontrado."
+        )
+
+    _validate_photo_file(photo_file, signer.full_name)
+    photo_bytes = await _read_upload_with_limit(
+        photo_file, MAX_PHOTO_FILE_SIZE, f"foto de {signer.full_name}"
+    )
+
+    upload_dir = Path("uploads")
+    upload_dir.mkdir(exist_ok=True)
+    photo_path = upload_dir / f"{uuid.uuid4()}-{photo_file.filename}"
+    photo_path.write_bytes(photo_bytes)
+
+    try:
+        embedding = await asyncio.to_thread(
+            extract_enrollment_embedding, str(photo_path)
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+    doc_signer.photo_id_url = str(photo_path)
+    doc_signer.face_embedding = embedding.tolist()
+    doc_signer.status_id = SignerStatus.PENDING.value
+
+    await db.commit()
+    return {"message": "Foto do signatário atualizada com sucesso."}
+
+
 @router.get("", responses=_401 | _500)
 async def list_documents(
-    current_user: User = Depends(get_current_user), 
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     return await document_service.get_documents_by_user(db, current_user)

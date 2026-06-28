@@ -45,6 +45,7 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
   final Map<String, String> _livenessFrames = {};
 
   bool _initializing = false;
+  bool _capturingFrame = false;
 
   bool get _isDocumentLiveness => widget.documentId != null;
 
@@ -87,7 +88,7 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
 
       final controller = CameraController(
         front,
-        ResolutionPreset.medium,
+        ResolutionPreset.high,
         enableAudio: false,
       );
 
@@ -131,96 +132,109 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
   }
 
 
-  Future<void> _captureAndVerify() async {
-    final controller = _controller;
+  /// Captura disparada pelo botão: o usuário vira levemente e captura quando
+  /// estiver pronto. A câmera permanece ativa entre os passos (não é destruída
+  /// e recriada a cada frame), só avançamos o índice do desafio.
+  Future<void> _onCapturePressed() async {
+    if (_capturingFrame) return;
 
-    if (controller == null || !controller.value.isInitialized) return;
+    final frame = await _captureFrameBase64();
+    if (frame == null) return _failCapture();
 
-    setState(() => _state = CaptureState.capturing);
-
-    try {
-      final XFile photo = await controller.takePicture();
-
-     _controller = null;
-      await Future.delayed(const Duration(milliseconds: 350));
-      await _disposeController(controller);
-
+    if (widget.captureOnly) {
+      await _disposeCamera();
       if (!mounted) return;
-      setState(() => _state = CaptureState.processing);
-
-      final bytes = await photo.readAsBytes();
-      final base64Image = base64Encode(bytes);
-
-      if (widget.captureOnly) {
-        if (!mounted) return;
-        Navigator.of(context).pop(base64Image);
-        return;
-      }
-
-      if (_isDocumentLiveness) {
-        final step = _challengeSteps[_challengeIndex]['key']!;
-        _livenessFrames[step] = base64Image;
-
-        if (_challengeIndex < _challengeSteps.length - 1) {
-          _challengeIndex++;
-          setState(() => _state = CaptureState.idle);
-          await _startCamera();
-          return;
-        }
-
-        final livenessSw = Stopwatch()..start();
-        final success = await _authRepository.verifyDocumentLiveness(
-          documentId: widget.documentId!,
-          frames: _livenessFrames,
-        );
-        livenessSw.stop();
-        debugPrint(
-          '[TEMPO] Prova de Vida (round-trip até sucesso=$success) levou '
-          '${livenessSw.elapsedMilliseconds} ms',
-        );
-
-        if (!mounted) return;
-
-        setState(() {
-          _verificationSuccess = success;
-          _message = success
-              ? "Validação realizada com sucesso!"
-              : "Não foi possível validar rosto e movimentação.";
-          _state = CaptureState.result;
-        });
-        return;
-      }
-
-      final faceSw = Stopwatch()..start();
-      final success =
-          await _authRepository.verifyFace(base64Image, widget.userId);
-      faceSw.stop();
-      debugPrint(
-        '[TEMPO] Reconhecimento Facial (round-trip até sucesso=$success) levou '
-        '${faceSw.elapsedMilliseconds} ms',
-      );
-
-      if (!mounted) return;
-
-      setState(() {
-        _verificationSuccess = success;
-        _message = success
-            ? "Verificação realizada com sucesso!"
-            : "O rosto não corresponde ao cadastro.";
-        _state = CaptureState.result;
-      });
-    } catch (_) {
-      _controller = null;
-      await Future.delayed(const Duration(milliseconds: 350));
-      await _disposeController(controller);
-
-      if (!mounted) return;
-      setState(() {
-        _verificationSuccess = false;
-        _message = "Erro ao capturar imagem.";
-        _state = CaptureState.result;
-      });
+      Navigator.of(context).pop(frame);
+      return;
     }
+
+    if (_isDocumentLiveness) {
+      _livenessFrames[_challengeSteps[_challengeIndex]['key']!] = frame;
+      if (_challengeIndex < _challengeSteps.length - 1) {
+        setState(() => _challengeIndex++);
+        return;
+      }
+      await _submitLiveness();
+      return;
+    }
+
+    await _submitFace(frame);
+  }
+
+  /// Captura um único frame mantendo a câmera viva. Retorna o base64 ou null.
+  Future<String?> _captureFrameBase64() async {
+    final controller = _controller;
+    if (controller == null || !controller.value.isInitialized) return null;
+    try {
+      if (mounted) setState(() => _capturingFrame = true);
+      final XFile photo = await controller.takePicture();
+      final bytes = await photo.readAsBytes();
+      return base64Encode(bytes);
+    } catch (_) {
+      return null;
+    } finally {
+      if (mounted) setState(() => _capturingFrame = false);
+    }
+  }
+
+  Future<void> _submitLiveness() async {
+    if (!mounted) return;
+    setState(() => _state = CaptureState.processing);
+    await _disposeCamera();
+
+    final livenessSw = Stopwatch()..start();
+    final success = await _authRepository.verifyDocumentLiveness(
+      documentId: widget.documentId!,
+      frames: _livenessFrames,
+    );
+    livenessSw.stop();
+    debugPrint(
+      '[TEMPO] Prova de Vida (round-trip até sucesso=$success) levou '
+      '${livenessSw.elapsedMilliseconds} ms',
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _verificationSuccess = success;
+      _message = success
+          ? "Validação realizada com sucesso!"
+          : "Não foi possível validar rosto e movimentação.";
+      _state = CaptureState.result;
+    });
+  }
+
+  Future<void> _submitFace(String base64Image) async {
+    if (!mounted) return;
+    setState(() => _state = CaptureState.processing);
+    await _disposeCamera();
+
+    final faceSw = Stopwatch()..start();
+    final success =
+        await _authRepository.verifyFace(base64Image, widget.userId);
+    faceSw.stop();
+    debugPrint(
+      '[TEMPO] Reconhecimento Facial (round-trip até sucesso=$success) levou '
+      '${faceSw.elapsedMilliseconds} ms',
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _verificationSuccess = success;
+      _message = success
+          ? "Verificação realizada com sucesso!"
+          : "O rosto não corresponde ao cadastro.";
+      _state = CaptureState.result;
+    });
+  }
+
+  Future<void> _failCapture() async {
+    await _disposeCamera();
+    if (!mounted) return;
+    setState(() {
+      _verificationSuccess = false;
+      _message = "Erro ao capturar imagem.";
+      _state = CaptureState.result;
+    });
   }
 
   @override
@@ -339,7 +353,7 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
         Text(
-          step?['title'] ?? "Tire sua foto",
+          step?['title'] ?? "Mantenha o rosto na câmera",
           style: GoogleFonts.poppins(
             fontSize: 24,
             fontWeight: FontWeight.bold,
@@ -348,24 +362,41 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
         ),
         const SizedBox(height: 8),
         Text(
-          step?['subtitle'] ?? "Centralize seu rosto no círculo",
+          step?['subtitle'] ?? "Centralize seu rosto no círculo e capture.",
           style: GoogleFonts.poppins(
             fontSize: 16,
             color: AppColors.primaryText.withValues(alpha: 0.7),
           ),
         ),
         const SizedBox(height: 24),
-        SizedBox(
-          width: 300,
-          height: 400,
-          child: ClipOval(
-            child: AspectRatio(
-              aspectRatio: _controller!.value.aspectRatio,
-              child: CameraPreview(_controller!),
+        Stack(
+          alignment: Alignment.center,
+          children: [
+            SizedBox(
+              width: 300,
+              height: 400,
+              child: ClipOval(
+                child: AspectRatio(
+                  aspectRatio: _controller!.value.aspectRatio,
+                  child: CameraPreview(_controller!),
+                ),
+              ),
+            ),
+            if (_capturingFrame)
+              const CircularProgressIndicator(color: Colors.white),
+          ],
+        ),
+        const SizedBox(height: 16),
+        if (_isDocumentLiveness)
+          Text(
+            "Etapa ${_challengeIndex + 1} de ${_challengeSteps.length}",
+            style: GoogleFonts.poppins(
+              fontSize: 14,
+              fontWeight: FontWeight.w500,
+              color: AppColors.primaryText.withValues(alpha: 0.6),
             ),
           ),
-        ),
-        const SizedBox(height: 32),
+        const SizedBox(height: 16),
         ElevatedButton.icon(
           icon: const Icon(Icons.camera_alt),
           label: Text(
@@ -373,7 +404,7 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
                 ? "Capturar ${_challengeIndex + 1}/${_challengeSteps.length}"
                 : "Capturar Foto",
           ),
-          onPressed: _captureAndVerify,
+          onPressed: _capturingFrame ? null : _onCapturePressed,
           style: _buildButtonStyle(),
         ),
       ],
@@ -418,6 +449,7 @@ class _FacialRecognitionScreenState extends State<FacialRecognitionScreen> {
                   _verificationSuccess = null;
                   _message = null;
                   _challengeIndex = 0;
+                  _capturingFrame = false;
                   _livenessFrames.clear();
                 });
               }

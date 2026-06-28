@@ -27,8 +27,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.api.v1.responses import err, _401, _422, _500
 from pydantic import BaseModel
 
-# Limiar de similaridade facial (cosseno), idêntico ao de face_verification.
-FACE_SIMILARITY_THRESHOLD = 0.6
+FACE_SIMILARITY_THRESHOLD = 0.40
 
 router = APIRouter(prefix="/api")
 

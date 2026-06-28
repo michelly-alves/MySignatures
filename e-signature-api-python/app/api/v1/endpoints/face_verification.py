@@ -26,8 +26,8 @@ from app.utils.timing import log_duration
 
 router = APIRouter(prefix="/face-verification", tags=["Face Verification"])
 
-SIMILARITY_THRESHOLD = 0.6
-YAW_FRONT_MAX  = 20.0  
+SIMILARITY_THRESHOLD = 0.40
+YAW_FRONT_MAX  = 20.0
 YAW_DELTA_MIN  = 8.0   
 
 logger = logging.getLogger(__name__)
@@ -150,9 +150,6 @@ async def verify_face(
     if not signer:
         raise HTTPException(404, "Signer não encontrado")
 
-    if not signer.face_embedding:
-        raise HTTPException(404, "Biometria não cadastrada")
-
     try:
         stmt = select(DocumentSigner).where(DocumentSigner.signer_id == signer.signer_id)
         if document_id is not None:
@@ -167,6 +164,10 @@ async def verify_face(
 
     if not doc_signer:
         raise HTTPException(404, "Signer não vinculado a documento")
+
+    reference_embedding = doc_signer.face_embedding or signer.face_embedding
+    if not reference_embedding:
+        raise HTTPException(404, "Biometria não cadastrada")
 
     try:
         upload_dir = Path("uploads/selfies")
@@ -189,7 +190,7 @@ async def verify_face(
                 str(selfie_path)
             )
             similarity = compare_embeddings(
-                stored_embedding=signer.face_embedding,
+                stored_embedding=reference_embedding,
                 selfie_embedding=selfie_embedding,
             )
     except HTTPException:
@@ -278,20 +279,23 @@ async def verify_document_liveness(
     if not doc_signer:
         raise HTTPException(404, "Signatário não vinculado a este documento")
 
+    reference_embedding = doc_signer.face_embedding or signer.face_embedding
+    if not reference_embedding:
+        raise HTTPException(404, "Biometria não cadastrada para este documento")
+
     front_bytes = _decode_image(frames["front"].image_base64)
     left_bytes = _decode_image(frames["left"].image_base64)
     right_bytes = _decode_image(frames["right"].image_base64)
 
     with log_duration(logger, "Prova de Vida (biometria + pose 3 frames)", document_id=document_id):
         try:
-            # Frame frontal: embedding e yaw extraídos numa única inferência.
             selfie_embedding, front_yaw = extract_face_embedding_and_yaw_from_bytes(front_bytes)
         except Exception:
             logger.exception("Erro ao extrair embedding frontal")
             raise HTTPException(400, "Rosto não detectado no frame frontal")
 
         similarity = compare_embeddings(
-            stored_embedding=signer.face_embedding,
+            stored_embedding=reference_embedding,
             selfie_embedding=selfie_embedding,
         )
 

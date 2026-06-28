@@ -117,7 +117,17 @@ class _SignUpScreenState extends State<SignUpScreen> {
 
         if (!mounted) return;
 
+        bool otpSent = false;
         if (otpResponse.statusCode == 200) {
+          try {
+            final body = json.decode(otpResponse.body) as Map<String, dynamic>;
+            otpSent = body['expires_at'] != null;
+          } catch (_) {
+            otpSent = false;
+          }
+        }
+
+        if (otpSent) {
           Navigator.push(
             context,
             MaterialPageRoute(
@@ -128,9 +138,9 @@ class _SignUpScreenState extends State<SignUpScreen> {
             ),
           );
         } else {
-          scaffoldMessenger.showSnackBar(SnackBar(
+          scaffoldMessenger.showSnackBar(const SnackBar(
             backgroundColor: Colors.orange,
-            content: Text('Conta criada, mas erro ao enviar OTP. Contate o suporte.'),
+            content: Text('Conta criada, mas não foi possível enviar o código por WhatsApp. Contate o suporte.'),
           ));
         }
       } catch (_) {

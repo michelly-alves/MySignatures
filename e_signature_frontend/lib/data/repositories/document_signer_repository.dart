@@ -52,4 +52,44 @@ class DocumentSignerRepository {
       rethrow;
     }
   }
+
+Future<String?> replaceSignerPhoto({
+    required int documentId,
+    required int signerId,
+    required String fileName,
+    required Uint8List bytes,
+  }) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString('jwt_token');
+      if (token == null) return 'Sessão expirada. Faça login novamente.';
+
+      final uri = Uri.parse(
+          '$_baseUrl/documents/$documentId/signers/$signerId/photo');
+      final request = http.MultipartRequest('PUT', uri)
+        ..headers['Authorization'] = 'Bearer $token'
+        ..files.add(http.MultipartFile.fromBytes(
+          'photo_file',
+          bytes,
+          filename: fileName,
+        ));
+
+      final streamed = await request.send();
+      final response = await http.Response.fromStream(streamed);
+      SessionManager.isUnauthorized(response.statusCode);
+
+      if (response.statusCode == 200) return null;
+
+      try {
+        final data = jsonDecode(response.body);
+        if (data is Map && data['detail'] != null) {
+          return data['detail'].toString();
+        }
+      } catch (_) {}
+      return 'Erro ao atualizar a foto (${response.statusCode}).';
+    } catch (e) {
+      debugPrint('Erro replaceSignerPhoto: $e');
+      return 'Erro inesperado ao atualizar a foto.';
+    }
+  }
 }

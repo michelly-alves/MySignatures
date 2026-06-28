@@ -1,5 +1,6 @@
-from sqlalchemy import Column, Integer, ForeignKey, DateTime, Float
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Float
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 
 from app.db.base import Base
@@ -26,6 +27,9 @@ class DocumentSigner(Base):
         nullable=False,
         default=1,
     )
+
+    photo_id_url = Column(String, nullable=True)
+    face_embedding = Column(JSONB, nullable=True)
 
     face_match_score = Column(Float, nullable=True)
     verified_at = Column(DateTime, nullable=True)

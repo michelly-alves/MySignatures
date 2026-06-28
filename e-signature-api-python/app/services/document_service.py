@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import secrets
 import string
@@ -6,6 +7,30 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 _log = logging.getLogger(__name__)
+
+EMAIL_MAX_ATTEMPTS = 3
+EMAIL_RETRY_DELAY_SECONDS = 2
+
+
+async def _send_with_retry(send_fn, *, email: str, document_id: int, email_kind: str) -> bool:
+    """Tenta enviar um e-mail algumas vezes. Retorna True se enviou, False caso contrário."""
+    for attempt in range(1, EMAIL_MAX_ATTEMPTS + 1):
+        try:
+            await asyncio.to_thread(send_fn)
+            return True
+        except Exception as exc:
+            _log.warning(
+                "Falha ao enviar e-mail '%s' para %s (documento %s) tentativa %d/%d: %s",
+                email_kind,
+                email,
+                document_id,
+                attempt,
+                EMAIL_MAX_ATTEMPTS,
+                exc,
+            )
+            if attempt < EMAIL_MAX_ATTEMPTS:
+                await asyncio.sleep(EMAIL_RETRY_DELAY_SECONDS)
+    return False
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -23,7 +48,7 @@ from app.core.config import settings
 from app.security.password import hash_password
 from app.security.jwt import create_notification_jwt
 from app.utils.email import send_pending_document_email, send_set_password_email
-from app.services.face_recognition import extract_face_embedding_from_bytes, extract_face_embedding_from_path
+from app.services.face_recognition import extract_face_embedding_from_bytes, extract_enrollment_embedding
 
 
 def generate_secure_token(length: int = 32) -> str:
@@ -101,7 +126,10 @@ async def create_document_with_signers(
     pending_emails: list[dict] = []
     for input_signer, national_id in normalized:
         result = await db.execute(
-            select(User).where(User.email == input_signer.email)
+            select(User).where(
+                User.email == input_signer.email,
+                User.deleted_at.is_(None),
+            )
         )
         user = result.scalar_one_or_none()
         user_was_created = user is None
@@ -114,7 +142,7 @@ async def create_document_with_signers(
             user = User(
                 email=input_signer.email,
                 password_hash=None,
-                role=2  # SIGNER
+                role=Role.SIGNER
             )
             db.add(user)
             await db.flush()
@@ -143,23 +171,32 @@ async def create_document_with_signers(
             db.add(signer)
             await db.flush()
 
+        # Biometria POR DOCUMENTO: extrai sempre da foto enviada para ESTE
+        # documento, mesmo que o signatário já exista. Garante que a validação
+        # facial deste documento usa exatamente a foto deste registro.
+        if not input_signer.photo_id_url:
+            raise ValueError(
+                f"Foto do signatário {input_signer.full_name} é obrigatória para biometria"
+            )
+        try:
+            embedding = extract_enrollment_embedding(input_signer.photo_id_url)
+            embedding_list = embedding.tolist()
+        except Exception as e:
+            raise ValueError(
+                f"Erro ao gerar biometria facial de {input_signer.full_name}: {str(e)}"
+            )
+
+        # Enrollment de nível signatário só na primeira vez (referência usada em
+        # fluxos não atrelados a documento, como a rotação de chave).
         if signer.face_embedding is None:
-            if not input_signer.photo_id_url:
-                raise ValueError(
-                    f"Foto do signatário {input_signer.full_name} é obrigatória para biometria"
-                )
-            try:
-                embedding = extract_face_embedding_from_path(input_signer.photo_id_url)
-                signer.face_embedding = embedding.tolist()
-            except Exception as e:
-                raise ValueError(
-                    f"Erro ao gerar biometria facial de {input_signer.full_name}: {str(e)}"
-                )
+            signer.face_embedding = embedding_list
 
         db.add(DocumentSigner(
             document_id=document.document_id,
             signer_id=signer.signer_id,
-            status_id=1
+            status_id=1,
+            photo_id_url=input_signer.photo_id_url,
+            face_embedding=embedding_list,
         ))
 
         jti = str(uuid.uuid4())
@@ -181,34 +218,50 @@ async def create_document_with_signers(
     await db.commit()
     await db.refresh(document)
 
+    failed_emails: list[dict] = []
     for item in pending_emails:
-        try:
-            if item["user_was_created"]:
-                activation_link = (
-                    f"{settings.FRONTEND_BASE_URL}/auth/set-password?token={item['token']}"
-                )
-                send_set_password_email(
+        if item["user_was_created"]:
+            activation_link = (
+                f"{settings.FRONTEND_BASE_URL}/auth/set-password?token={item['token']}"
+            )
+            sent = await _send_with_retry(
+                lambda item=item, link=activation_link: send_set_password_email(
                     to_email=item["email"],
                     full_name=item["full_name"],
-                    reset_link=activation_link,
-                )
-            else:
-                documents_link = (
-                    f"{settings.FRONTEND_BASE_URL}/documents?token={item['token']}"
-                )
-                send_pending_document_email(
+                    reset_link=link,
+                ),
+                email=item["email"],
+                document_id=document.document_id,
+                email_kind="set-password",
+            )
+        else:
+            documents_link = (
+                f"{settings.FRONTEND_BASE_URL}/documents?token={item['token']}"
+            )
+            sent = await _send_with_retry(
+                lambda item=item, link=documents_link: send_pending_document_email(
                     to_email=item["email"],
                     full_name=item["full_name"],
                     document_name=document.file_name,
-                    documents_link=documents_link,
-                )
-        except Exception as exc:
-            _log.error(
-                "Documento %s criado mas e-mail falhou para %s: %s",
-                document.document_id,
-                item["email"],
-                exc,
+                    documents_link=link,
+                ),
+                email=item["email"],
+                document_id=document.document_id,
+                email_kind="pending-document",
             )
+
+        if not sent:
+            failed_emails.append(item)
+
+    if failed_emails:
+        # Documento e usuários já foram persistidos; signatários novos dependem
+        # deste e-mail para definir a senha. Registra de forma acionável para
+        # reenvio manual/automático posterior.
+        _log.error(
+            "Documento %s criado, mas o envio de e-mail falhou para: %s",
+            document.document_id,
+            ", ".join(item["email"] for item in failed_emails),
+        )
 
     return document
 

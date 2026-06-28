@@ -281,7 +281,10 @@ class _DocumentsListScreenState extends State<DocumentsListScreen> {
                     ],
                   ),
                   if (doc.statusId == 2 || doc.statusId == 3)
-                    SignersProgress(documentId: doc.documentId),
+                    SignersProgress(
+                      documentId: doc.documentId,
+                      canManage: context.read<AuthProvider>().companyId != null,
+                    ),
                   _buildSignatureSummary(doc),
                 ],
               ),

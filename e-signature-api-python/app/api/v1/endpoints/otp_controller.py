@@ -12,6 +12,7 @@ from app.schemas.otp import OtpRequest, OtpResponse, VerifyOtpRequest
 from app.services.whatsapp import send_otp_via_whatsapp
 from app.dependencies.auth import get_current_user
 from app.models.signer import Signer
+from app.models.company import Company
 from app.models.user import Role, User
 from app.api.v1.responses import err, _401, _422, _500
 
@@ -108,6 +109,8 @@ async def generate_otp(
 
     email = str(data.email)
 
+    phone_number: str | None = None
+
     result = await db.execute(
         select(Signer)
         .join(User, Signer.user_id == User.user_id)
@@ -115,8 +118,20 @@ async def generate_otp(
         .order_by(Signer.signer_id.desc())
     )
     signer = result.scalars().first()
+    if signer:
+        phone_number = signer.phone_number
+    else:
+        result = await db.execute(
+            select(Company)
+            .join(User, Company.user_id == User.user_id)
+            .where(User.email == email, Company.deleted_at.is_(None))
+            .order_by(Company.company_id.desc())
+        )
+        company = result.scalars().first()
+        if company:
+            phone_number = company.phone_number
 
-    if not signer:
+    if not phone_number:
         return OtpResponse(
             message="Se o e-mail estiver cadastrado, o código será enviado ao WhatsApp registrado.",
             expires_at=None,
@@ -125,7 +140,7 @@ async def generate_otp(
     return await _save_and_send_otp(
         db=db,
         email=email,
-        phone_number=signer.phone_number,
+        phone_number=phone_number,
     )
 
 
